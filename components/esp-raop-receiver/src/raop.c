@@ -523,7 +523,6 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			float volume;
 
 			sscanf(p, "%*[^:]:%f", &volume);
-			volume = (volume == -144.0) ? 0 : (1 + volume / 30);
 			success = ctx->cmd_cb(RAOP_INT_VOLUME, volume);
 		} else if (body && (p = strcasestr(body, "progress")) != NULL) {
 			int start, current, stop = 0;

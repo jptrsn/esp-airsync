@@ -6,6 +6,7 @@
 #include "esp_netif.h"
 #include "mdns.h"
 #include "esp_heap_caps.h"
+#include "math.h"
 #include <string.h>
 #include <stdarg.h>
 
@@ -186,12 +187,13 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
 // ---- Single instance support ----
 raop_handle_t *s_handle = NULL;
 
-static void apply_software_volume(const uint8_t *data, size_t len, uint8_t *out, float volume) {
+static void apply_software_volume(const uint8_t *data, size_t len, uint8_t *out, float volume_db) {
     const int16_t *samples = (const int16_t *)data;
     int16_t *out_samples = (int16_t *)out;
     size_t count = len / sizeof(int16_t);
+    float linear = powf(10.0f, volume_db / 20.0f);
     for (size_t i = 0; i < count; i++) {
-        int32_t scaled = (int32_t)(samples[i] * volume);
+        int32_t scaled = (int32_t)(samples[i] * linear);
         if (scaled > 32767) scaled = 32767;
         if (scaled < -32768) scaled = -32768;
         out_samples[i] = (int16_t)scaled;
@@ -200,7 +202,7 @@ static void apply_software_volume(const uint8_t *data, size_t len, uint8_t *out,
 
 static void internal_data_cb(const uint8_t *data, size_t len, uint32_t playtime) {
     if (s_handle && s_handle->config.volume_mode == RAOP_VOLUME_SOFTWARE
-            && s_handle->volume < 0.99f) {
+            && s_handle->volume > -144.0f && s_handle->volume < 0.0f) {
         static uint8_t scaled[MAX_FRAME_SIZE];
         apply_software_volume(data, len, scaled, s_handle->volume);
         if (!audio_buffer_write(scaled, len, playtime)) {

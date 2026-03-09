@@ -6,9 +6,15 @@
 
 #define CONFIG_DEVICE_NAME_MAX_LEN  31  // 32 byte buffer, 1 byte for null terminator
 
+#if CONFIG_IDF_TARGET_ESP32S3
+#define CONFIG_DEFAULT_BCK_PIN   11
+#define CONFIG_DEFAULT_WS_PIN    9
+#define CONFIG_DEFAULT_DOUT_PIN  10
+#else
 #define CONFIG_DEFAULT_BCK_PIN   26
 #define CONFIG_DEFAULT_WS_PIN    25
 #define CONFIG_DEFAULT_DOUT_PIN  22
+#endif
 
 #define WLED_DEFAULT_HOST "239.0.0.1"
 #define WLED_DEFAULT_PORT 11988
