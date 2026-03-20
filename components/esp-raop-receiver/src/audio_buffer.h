@@ -12,7 +12,7 @@ typedef void (*audio_pcm_tap_cb_t)(const uint8_t *data, size_t len, void *user_c
 
 // Initialize the audio buffer with output callback
 void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
-                       audio_pcm_tap_cb_t tap_cb);
+                       audio_pcm_tap_cb_t tap_cb, float *volume_ptr);
 
 // Start audio playback task
 void audio_buffer_start(void);

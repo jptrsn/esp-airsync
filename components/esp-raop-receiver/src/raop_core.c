@@ -6,7 +6,6 @@
 #include "esp_netif.h"
 #include "mdns.h"
 #include "esp_heap_caps.h"
-#include "math.h"
 #include <string.h>
 #include <stdarg.h>
 
@@ -49,7 +48,7 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
             }
 
             audio_buffer_init(handle->config.audio_output_cb, handle->config.user_ctx,
-                  handle->config.pcm_tap_cb);
+                  handle->config.pcm_tap_cb, &handle->volume);
 
             if (handle->config.event_cb) {
                 handle->config.event_cb(RAOP_EVENT_CONNECTED, NULL, handle->config.user_ctx);
@@ -187,31 +186,9 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
 // ---- Single instance support ----
 raop_handle_t *s_handle = NULL;
 
-static void apply_software_volume(const uint8_t *data, size_t len, uint8_t *out, float volume_db) {
-    const int16_t *samples = (const int16_t *)data;
-    int16_t *out_samples = (int16_t *)out;
-    size_t count = len / sizeof(int16_t);
-    float linear = powf(10.0f, volume_db / 20.0f);
-    for (size_t i = 0; i < count; i++) {
-        int32_t scaled = (int32_t)(samples[i] * linear);
-        if (scaled > 32767) scaled = 32767;
-        if (scaled < -32768) scaled = -32768;
-        out_samples[i] = (int16_t)scaled;
-    }
-}
-
 static void internal_data_cb(const uint8_t *data, size_t len, uint32_t playtime) {
-    if (s_handle && s_handle->config.volume_mode == RAOP_VOLUME_SOFTWARE
-            && s_handle->volume > -144.0f && s_handle->volume < 0.0f) {
-        static uint8_t scaled[MAX_FRAME_SIZE];
-        apply_software_volume(data, len, scaled, s_handle->volume);
-        if (!audio_buffer_write(scaled, len, playtime)) {
-            ESP_LOGW(TAG, "Failed to buffer audio frame");
-        }
-    } else {
-        if (!audio_buffer_write(data, len, playtime)) {
-            ESP_LOGW(TAG, "Failed to buffer audio frame");
-        }
+    if (!audio_buffer_write(data, len, playtime)) {
+        ESP_LOGW(TAG, "Failed to buffer audio frame");
     }
 }
 
@@ -230,7 +207,7 @@ esp_err_t raop_init(const raop_config_t *config, raop_handle_t **out_handle) {
 
     // Copy config
     memcpy(&handle->config, config, sizeof(raop_config_t));
-    handle->volume = 1.0f;
+    handle->volume = 0.0f;
 
     // Resolve device name
     uint8_t mac[6];

@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <string.h>
+#include "math.h"
 
 static const char *TAG = "audio_buffer";
 
@@ -34,6 +35,7 @@ static struct {
     // Optional PCM tap — called ~TAP_LOOKAHEAD_MS before playtime
     audio_pcm_tap_cb_t tap_cb;
     void *tap_user_ctx;
+    float *volume_ptr;
 } audio_buf = {0};
 
 static struct {
@@ -122,6 +124,25 @@ static void audio_output_task(void *arg) {
                 memcpy(data, frame->data, frame->len);
                 size_t len = frame->len;
 
+                // Apply software volume at read time
+                if (audio_buf.volume_ptr) {
+                    float vol_db = *audio_buf.volume_ptr;
+                    if (vol_db <= -144.0f) {
+                        memset(data, 0, len);
+                    } else if (vol_db < 0.0f) {
+                        float linear = powf(10.0f, vol_db / 20.0f);
+                        int16_t *samples = (int16_t *)data;
+                        size_t count = len / sizeof(int16_t);
+                        for (size_t i = 0; i < count; i++) {
+                            int32_t scaled = (int32_t)(samples[i] * linear);
+                            if (scaled > 32767) scaled = 32767;
+                            if (scaled < -32768) scaled = -32768;
+                            samples[i] = (int16_t)scaled;
+                        }
+                    }
+                    // vol_db == 0.0f: full volume, no scaling needed
+                }
+
                 frame->ready = false;
                 frame->tapped = false;
                 audio_buf.read_idx = (audio_buf.read_idx + 1) % BUFFER_FRAMES;
@@ -144,7 +165,7 @@ static void audio_output_task(void *arg) {
 }
 
 void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
-                       audio_pcm_tap_cb_t tap_cb) {
+                       audio_pcm_tap_cb_t tap_cb, float *volume_ptr) {
     // If already initialized, just return
     if (audio_buf.frames && audio_buf.mutex) {
         ESP_LOGD(TAG, "Audio buffer already initialized");
@@ -161,6 +182,7 @@ void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
     audio_buf.output_cb = output_cb;
     audio_buf.user_ctx = user_ctx;
     audio_buf.tap_cb = tap_cb;
+    audio_buf.volume_ptr = volume_ptr;
 
     // Allocate frame buffer in PSRAM
     audio_buf.frames = heap_caps_malloc(BUFFER_FRAMES * sizeof(audio_frame_t),
