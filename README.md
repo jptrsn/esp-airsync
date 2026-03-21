@@ -73,6 +73,18 @@ idf.py -p /dev/ttyUSB0 flash monitor
 5. Configure device name, if desired
 5. Reboot device to save settings and connect to configured wifi
 
+### Firmware Updates (OTA)
+
+Once the device is running and connected to WiFi, firmware can be updated without a USB connection via the built-in OTA update page in the web interface:
+
+1. Download the appropriate binary for your board from the [Releases page](https://codeberg.org/Edu_Coder/esp-airsync/releases):
+   - `esp-airsync-esp32.bin` for ESP32-WROVER-B
+   - `esp-airsync-esp32s3.bin` for ESP32-S3 N16R8
+2. Navigate to the device's web interface and go to **Firmware Update**
+3. Select the `.bin` file and click upload — the device will flash and reboot automatically
+
+The current firmware version is displayed on the update page.
+
 ## WLED Audio-Reactive Sync
 
 esp-airsync can stream real-time FFT audio analysis to a WLED device, enabling audio-reactive lighting effects synchronized to your music.
@@ -172,7 +184,7 @@ This license was chosen to maintain compatibility with the GPL-licensed componen
 
 ### Audio dropouts or stuttering
 - Check WiFi signal strength
-- Verify PSRAM is detected (should show 8MB PSRAM, 4MB mapped)
+- Check for interference from other 2.4GHz sources (microwaves, other wifi routers)
 - Monitor for "Buffer full" or "Skipping late frame" warnings in logs
 
 ### Authentication failures
