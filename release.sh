@@ -1,15 +1,15 @@
 #!/bin/bash
 set -e
 
-REPO="Edu_Coder/esp-airsync"
+REPO="jptrsn/esp-airsync"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ -f "$SCRIPT_DIR/.env" ]; then
     source "$SCRIPT_DIR/.env"
 fi
 
-if [ -z "$CODEBERG_TOKEN" ]; then
-    echo "Error: CODEBERG_TOKEN not set. Add it to .env or set it in your environment."
+if [ -z "$GITHUB_TOKEN" ]; then
+    echo "Error: GITHUB_TOKEN not set. Add it to .env or set it in your environment."
     exit 1
 fi
 
@@ -26,8 +26,8 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     source "$SCRIPT_DIR/.env"
 fi
 
-if [ -z "$CODEBERG_TOKEN" ]; then
-    echo "Error: CODEBERG_TOKEN not set. Add it to .env or set it in your environment."
+if [ -z "$GITHUB_TOKEN" ]; then
+    echo "Error: GITHUB_TOKEN not set. Add it to .env or set it in your environment."
     exit 1
 fi
 
@@ -49,14 +49,14 @@ echo "Tagging release $TAG..."
 git tag "$TAG"
 git push origin "$TAG"
 
-sleep 2  # give Codeberg a moment to register the tag
+sleep 2  # give GitHub a moment to register the tag
 
 echo "Creating release $TAG..."
 RELEASE=$(curl -s -X POST \
-    -H "Authorization: token $CODEBERG_TOKEN" \
+    -H "Authorization: token $GITHUB_TOKEN" \
     -H "Content-Type: application/json" \
     -d "{\"tag_name\": \"$TAG\", \"name\": \"$TAG\", \"body\": \"\", \"draft\": false}" \
-    https://codeberg.org/api/v1/repos/$REPO/releases)
+    https://api.github.com/repos/$REPO/releases)
 
 RELEASE_ID=$(echo $RELEASE | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
 
@@ -72,10 +72,10 @@ for ASSET in \
     "libesp-raop-receiver-esp32.a" \
     "libesp-raop-receiver-esp32s3.a"; do
     curl -s -X POST \
-        -H "Authorization: token $CODEBERG_TOKEN" \
+        -H "Authorization: token $GITHUB_TOKEN" \
         -H "Content-Type: application/octet-stream" \
         --data-binary @"$ASSET" \
-        "https://codeberg.org/api/v1/repos/$REPO/releases/$RELEASE_ID/assets?name=$ASSET"
+        "https://api.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$ASSET"
 done
 
 echo "Cleaning up..."

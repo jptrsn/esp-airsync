@@ -40,7 +40,7 @@ Pins can be reconfigured via the web interface.
 
 1. Clone the repository:
 ```bash
-git clone https://codeberg.org/edu_coder/esp-airsync.git
+git clone https://github.com/jptrsn/esp-airsync.git
 cd esp-airsync
 ```
 
@@ -77,7 +77,7 @@ idf.py -p /dev/ttyUSB0 flash monitor
 
 Once the device is running and connected to WiFi, firmware can be updated without a USB connection via the built-in OTA update page in the web interface:
 
-1. Download the appropriate binary for your board from the [Releases page](https://codeberg.org/Edu_Coder/esp-airsync/releases):
+1. Download the appropriate binary for your board from the [Releases page](https://github.com/jptrsn/esp-airsync/releases):
    - `esp-airsync-esp32.bin` for ESP32-WROVER-B
    - `esp-airsync-esp32s3.bin` for ESP32-S3 N16R8
 2. Navigate to the device's web interface and go to **Firmware Update**
@@ -213,7 +213,7 @@ idf.py build
 ## Contributing
 
 Contributions are welcome! Please:
-1. Fork the repository on Codeberg
+1. Fork the repository on GitHub
 2. Create a feature branch
 3. Make your changes with clear commit messages
 4. Submit a pull request
@@ -232,7 +232,7 @@ Contributions are welcome! Please:
 
 ## Support
 
-For issues, questions, or contributions, please use the Codeberg issue tracker.
+For issues, questions, or contributions, please use the GitHub issue tracker.
 
 ---
 
