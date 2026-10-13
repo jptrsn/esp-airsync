@@ -411,9 +411,15 @@ static int seq_order(seq_t a, seq_t b) {
 }
 
 /*---------------------------------------------------------------------------*/
-static void alac_decode(rtp_t *ctx, s16_t *dest, char *buf, int len, u16_t *outsize) {
+// NOTE: out size is returned as u16_t but MUST be computed from a 32-bit
+// accumulator. alac_to_pcm() (Apple ALACDecoder::Decode) performs a 32-bit
+// store into its out-frames pointer; passing a 16-bit target (as an earlier
+// local revision did via `u16_t *outsize` / `(unsigned int*) outsize`)
+// overflows 2 bytes of the caller's stack on every decoded packet.
+static u16_t alac_decode(rtp_t *ctx, s16_t *dest, char *buf, int len) {
 	unsigned char iv[16];
 	int aeslen;
+	unsigned int frames = 0;
 	assert(len<=MAX_PACKET);
 
 	if (ctx->decrypt) {
@@ -425,12 +431,18 @@ static void alac_decode(rtp_t *ctx, s16_t *dest, char *buf, int len, u16_t *outs
 		mbedtls_aes_crypt_cbc(&ctx->aes, MBEDTLS_AES_DECRYPT, aeslen, iv, (unsigned char*) buf, ctx->decrypt_buf);
 #endif
 		memcpy(ctx->decrypt_buf+aeslen, buf+aeslen, len-aeslen);
-		alac_to_pcm(ctx->alac_codec, (unsigned char*) ctx->decrypt_buf, (unsigned char*) dest, 2, (unsigned int*) outsize);
+		if (!alac_to_pcm(ctx->alac_codec, (unsigned char*) ctx->decrypt_buf, (unsigned char*) dest, 2, &frames)) {
+			LOG_WARN("[%p]: ALAC decode failed (len=%d)", ctx, len);
+			frames = 0;
+		}
 	} else {
-		alac_to_pcm(ctx->alac_codec, (unsigned char*) buf, (unsigned char*) dest, 2, (unsigned int*) outsize);
+		if (!alac_to_pcm(ctx->alac_codec, (unsigned char*) buf, (unsigned char*) dest, 2, &frames)) {
+			LOG_WARN("[%p]: ALAC decode failed (len=%d)", ctx, len);
+			frames = 0;
+		}
 	}
 
-	*outsize *= 4;
+	return (u16_t)(frames * 4);
 }
 
 
@@ -524,10 +536,8 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 		ctx->in_frames = 0;
 	}
 
-	u16_t out_len = 0;
 	if (abuf) {
-		alac_decode(ctx, abuf->data, data, len, &out_len);
-		abuf->len = out_len;
+		abuf->len = alac_decode(ctx, abuf->data, data, len);
 		abuf->ready = 1;
         abuf->missed = 0;
 		// this is the local rtptime when this frame is expected to play
@@ -642,6 +652,23 @@ static void rtp_thread_func(void *arg) {
 		int idx = 0;
 		char *pktp = packet;
 		struct timeval timeout = {0, 100*1000};
+
+		// Periodic RTP health log: recovery counters + stack high-water mark.
+		// A low/decreasing high-water mark or rising silent/discarded counts
+		// correlate with audible glitches.
+		{
+			static uint32_t rtp_last_log = 0;
+			u32_t now = gettime_ms();
+			if (rtp_last_log == 0 || now - rtp_last_log >= 5000) {
+				rtp_last_log = now;
+				UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+				LOG_INFO("[%p]: rtp health [W:%hu R:%hu] resent_req=%u resent_rec=%u "
+				         "silent=%u discarded=%u stack_hwm=%uB",
+				         ctx, ctx->ab_write, ctx->ab_read, ctx->resent_req,
+				         ctx->resent_rec, ctx->silent_frames, ctx->discarded,
+				         (uint32_t)(hwm * sizeof(StackType_t)));
+			}
+		}
 
 		FD_ZERO(&fds);
 		for (i = 0; i < 3; i++)	{ FD_SET(ctx->rtp_sockets[i].sock, &fds); }

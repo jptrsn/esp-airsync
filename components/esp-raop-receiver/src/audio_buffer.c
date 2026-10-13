@@ -43,12 +43,33 @@ static struct {
     uint32_t pause_frames;
 } timing_correction = {0, 0};
 
+// Health / diagnostics counters (measurement-driven debugging of the
+// intermittent mid-track glitch). Reset on flush so each track is clean.
+static struct {
+    uint32_t frames_played;     // frames actually sent to output_cb
+    uint32_t frames_written;    // frames accepted by audio_buffer_write
+    uint32_t underruns;         // output task found no ready frame at playtime
+    uint32_t dropped_full;      // writes rejected because the ring was full
+    uint32_t skip_total;        // frames dropped by timing correction
+    uint32_t pause_total;       // silence frames inserted by timing correction
+    uint32_t last_log_ms;       // timestamp of last periodic health log
+} ab_stats = {0};
+
+// Hot-path scratch buffers kept off the audio_output_task stack. Three
+// 2048-byte branch-local arrays are a stack-overflow risk on the 4096-byte
+// task stack if the compiler does not reuse the array slots. The audio
+// output task is the sole consumer, so file-scope storage is safe.
+static uint8_t g_silence_buf[MAX_FRAME_SIZE];
+static uint8_t g_tap_buf[MAX_FRAME_SIZE];
+static uint8_t g_play_buf[MAX_FRAME_SIZE];
+
 static uint32_t gettime_ms(void) {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
 static void audio_output_task(void *arg) {
     ESP_LOGD(TAG, "Audio output task started");
+    static uint32_t last_underrun_ms = 0;
 
     while (audio_buf.running) {
         // Wait until we have a start time
@@ -59,6 +80,7 @@ static void audio_output_task(void *arg) {
 
         // Handle skip frames
         if (timing_correction.skip_frames > 0) {
+            uint32_t skipped = 0;
             xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
 
             while (timing_correction.skip_frames > 0 && audio_buf.read_idx != audio_buf.write_idx) {
@@ -66,18 +88,20 @@ static void audio_output_task(void *arg) {
                 audio_buf.frames[audio_buf.read_idx].tapped = false;
                 audio_buf.read_idx = (audio_buf.read_idx + 1) % BUFFER_FRAMES;
                 timing_correction.skip_frames--;
+                skipped++;
             }
 
             xSemaphoreGive(audio_buf.mutex);
+            if (skipped) ab_stats.skip_total += skipped;
             continue;
         }
 
         // Handle pause frames (insert silence)
         if (timing_correction.pause_frames > 0) {
-            uint8_t silence[MAX_FRAME_SIZE];
-            memset(silence, 0, 1408); // 352 samples * 4 bytes
-            audio_buf.output_cb(silence, 1408, audio_buf.user_ctx);
+            memset(g_silence_buf, 0, 1408); // 352 samples * 4 bytes
+            audio_buf.output_cb(g_silence_buf, 1408, audio_buf.user_ctx);
             timing_correction.pause_frames--;
+            ab_stats.pause_total++;
             continue;
         }
 
@@ -97,11 +121,10 @@ static void audio_output_task(void *arg) {
                     frame->playtime > 0 && now >= frame->playtime - TAP_LOOKAHEAD_MS) {
                     frame->tapped = true;
                     // Copy data before releasing mutex — tap must not block
-                    uint8_t tap_data[MAX_FRAME_SIZE];
-                    memcpy(tap_data, frame->data, frame->len);
+                    memcpy(g_tap_buf, frame->data, frame->len);
                     size_t tap_len = frame->len;
                     xSemaphoreGive(audio_buf.mutex);
-                    audio_buf.tap_cb(tap_data, tap_len, audio_buf.tap_user_ctx);
+                    audio_buf.tap_cb(g_tap_buf, tap_len, audio_buf.tap_user_ctx);
                     // Re-acquire and re-check — frame may have been skipped/flushed
                     xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
                     frame = &audio_buf.frames[audio_buf.read_idx];
@@ -120,18 +143,17 @@ static void audio_output_task(void *arg) {
                     continue;
                 }
 
-                uint8_t data[MAX_FRAME_SIZE];
-                memcpy(data, frame->data, frame->len);
+                memcpy(g_play_buf, frame->data, frame->len);
                 size_t len = frame->len;
 
                 // Apply software volume at read time
                 if (audio_buf.volume_ptr) {
                     float vol_db = *audio_buf.volume_ptr;
                     if (vol_db <= -144.0f) {
-                        memset(data, 0, len);
+                        memset(g_play_buf, 0, len);
                     } else if (vol_db < 0.0f) {
                         float linear = powf(10.0f, vol_db / 20.0f);
-                        int16_t *samples = (int16_t *)data;
+                        int16_t *samples = (int16_t *)g_play_buf;
                         size_t count = len / sizeof(int16_t);
                         for (size_t i = 0; i < count; i++) {
                             int32_t scaled = (int32_t)(samples[i] * linear);
@@ -149,14 +171,42 @@ static void audio_output_task(void *arg) {
 
                 xSemaphoreGive(audio_buf.mutex);
 
-                audio_buf.output_cb(data, len, audio_buf.user_ctx);
+                audio_buf.output_cb(g_play_buf, len, audio_buf.user_ctx);
+                ab_stats.frames_played++;
             } else {
                 xSemaphoreGive(audio_buf.mutex);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
         } else {
+            // Ring drained while we are supposed to be playing: a playback
+            // underrun (silence until the RTP producer refills it).
             xSemaphoreGive(audio_buf.mutex);
+            uint32_t now_ms = gettime_ms();
+            if (now_ms - last_underrun_ms > 100) {
+                last_underrun_ms = now_ms;
+                ab_stats.underruns++;
+                ESP_LOGW(TAG, "UNDERRUN: ring empty while playing (count=%u)", ab_stats.underruns);
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Periodic health log: ring fill, counters, stack high-water mark.
+        {
+            uint32_t now_ms = gettime_ms();
+            if (ab_stats.last_log_ms == 0 || now_ms - ab_stats.last_log_ms >= 5000) {
+                ab_stats.last_log_ms = now_ms;
+                xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
+                uint32_t fill = (audio_buf.write_idx >= audio_buf.read_idx)
+                    ? (audio_buf.write_idx - audio_buf.read_idx)
+                    : (BUFFER_FRAMES - audio_buf.read_idx + audio_buf.write_idx);
+                xSemaphoreGive(audio_buf.mutex);
+                UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+                ESP_LOGI(TAG, "health: fill=%u/%u played=%u written=%u underruns=%u "
+                            "skipped=%u paused=%u stack_hwm=%uB",
+                         fill, BUFFER_FRAMES, ab_stats.frames_played, ab_stats.frames_written,
+                         ab_stats.underruns, ab_stats.skip_total, ab_stats.pause_total,
+                         (uint32_t)(hwm * sizeof(StackType_t)));
+            }
         }
     }
 
@@ -288,6 +338,7 @@ bool audio_buffer_write(const uint8_t *data, size_t len, uint32_t playtime) {
             frame->tapped = false;
 
             audio_buf.write_idx = next_write;
+            ab_stats.frames_written++;
 
             xSemaphoreGive(audio_buf.mutex);
             return true;
@@ -301,7 +352,8 @@ bool audio_buffer_write(const uint8_t *data, size_t len, uint32_t playtime) {
         }
     }
 
-    ESP_LOGW(TAG, "Buffer full after retries, dropping frame");
+    ab_stats.dropped_full++;
+    ESP_LOGW(TAG, "Buffer full after retries, dropping frame (dropped_full=%u)", ab_stats.dropped_full);
     return false;
 }
 
@@ -318,6 +370,16 @@ void audio_buffer_flush(void) {
     audio_buf.write_idx = 0;
 
     xSemaphoreGive(audio_buf.mutex);
+
+    // Clear any pending timing correction so a skip/pause burst in flight at
+    // flush time does not bleed into the next track (previously never reset).
+    timing_correction.skip_frames = 0;
+    timing_correction.pause_frames = 0;
+
+    // Reset per-track diagnostics so each track starts clean.
+    uint32_t keep_log_ms = ab_stats.last_log_ms;
+    memset(&ab_stats, 0, sizeof(ab_stats));
+    ab_stats.last_log_ms = keep_log_ms;
 
     ESP_LOGD(TAG, "Buffer flushed");
 }

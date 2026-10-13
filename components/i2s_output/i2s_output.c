@@ -2,6 +2,7 @@
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 
 static const char *TAG = "i2s_output";
@@ -10,6 +11,14 @@ static int16_t *volume_buffer = NULL;
 static size_t volume_buffer_size = 0;
 
 static i2s_chan_handle_t tx_handle = NULL;
+
+// Diagnostics: measure the actual bytes/s handed to the DAC and compare with
+// the expected 176400 B/s (44100 Hz * 2 ch * 2 bytes). A sustained deficit
+// during active playback means the I2S DMA is starving (underflow) because
+// the audio_output_task cannot refill it fast enough.
+static uint64_t i2s_total_bytes = 0;
+static uint32_t i2s_last_log_ms = 0;
+static uint64_t i2s_last_log_bytes = 0;
 
 void i2s_output_set_volume(float volume)
 {
@@ -123,8 +132,21 @@ void i2s_output_write(const uint8_t *data, size_t len)
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
-    } else if (bytes_written != len) {
-        ESP_LOGW(TAG, "I2S partial write: %d/%d bytes", bytes_written, len);
+    } else {
+        if (bytes_written != len) {
+            ESP_LOGW(TAG, "I2S partial write: %d/%d bytes", bytes_written, len);
+        }
+        i2s_total_bytes += bytes_written;
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        if (i2s_last_log_ms == 0 || now - i2s_last_log_ms >= 5000) {
+            uint32_t dt = i2s_last_log_ms ? (now - i2s_last_log_ms) : 5000;
+            uint64_t db = i2s_total_bytes - i2s_last_log_bytes;
+            i2s_last_log_ms = now;
+            i2s_last_log_bytes = i2s_total_bytes;
+            uint32_t bps = (uint32_t)((db * 1000ULL) / dt);
+            ESP_LOGI(TAG, "i2s: %u B/s (expected 176400) over %u ms (%llu bytes)",
+                     bps, dt, (unsigned long long)db);
+        }
     }
 }
 

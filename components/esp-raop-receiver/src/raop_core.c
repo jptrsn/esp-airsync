@@ -108,9 +108,13 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
             if (error < -50) {
                 uint32_t skip = (-error * 44100) / (352 * 1000);
                 audio_buffer_skip_frames(skip);
+                ESP_LOGW(TAG, "drift: SKIP %u frames (err=%d ms, buffered=%u, t=%u ms)",
+                         skip, error, frames_buffered, now);
             } else if (error > 50) {
                 uint32_t pause = (error * 44100) / (352 * 1000);
                 audio_buffer_pause_frames(pause);
+                ESP_LOGW(TAG, "drift: PAUSE %u frames (err=%d ms, buffered=%u, t=%u ms)",
+                         pause, error, frames_buffered, now);
             }
             break;
         }
