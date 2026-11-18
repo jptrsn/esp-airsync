@@ -173,6 +173,10 @@ typedef struct {
 
 /**
  * @brief Initialize RAOP receiver
+ *
+ * The receiver is a process-wide singleton: a second raop_init() while one is
+ * active returns ESP_ERR_RAOP_ALREADY_INIT. Task stacks and the RTP decode
+ * queue are static, so only one RAOP session can exist at a time.
  */
 esp_err_t raop_init(const raop_config_t *config, raop_handle_t **out_handle);
 

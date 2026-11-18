@@ -10,3 +10,14 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+
+# mDNS must stay schedulable while streaming. The default priority of 1 leaves
+# the responder starved behind the RTP receive/decode tasks, so it cannot answer
+# unicast SRV/A resolves and controllers drop the device mid-playback. Keep it
+# level with the pthread default (decode runs one below it, RTP RX above it):
+# raising discovery above the audio path would only trade one starvation for
+# another.
+CONFIG_MDNS_TASK_PRIORITY=5
+# Keep the responder off core 0's BT/WiFi work. Valid on these dual-core targets
+# (depends on !FREERTOS_UNICORE, true for esp32 and esp32s3).
+CONFIG_MDNS_TASK_AFFINITY_CPU1=y

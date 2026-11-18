@@ -96,11 +96,14 @@ void i2s_output_write(const uint8_t *data, size_t len)
     // and the WiFi stack (which manifests as total packet loss).
     #define VOLUME_BUF_MAX 2048
     static int16_t volume_buf[VOLUME_BUF_MAX / sizeof(int16_t)];
-    // audio_buffer caps frames at MAX_FRAME_SIZE == 2048 (see audio_buffer.c),
-    // so with this scratch sized to match, the pass-through below is unreachable.
+    // audio_buffer caps frames at MAX_FRAME_SIZE == 2048 (see audio_buffer.c), so
+    // for that producer this scratch always fits. i2s_output_write() is a public
+    // entry point with no size contract, though, so a caller that bypasses
+    // audio_buffer can still exceed it -- the pass-through below is a safety
+    // valve for that case, not dead code.
     if (len > sizeof(volume_buf)) {
-        // Only reachable if a caller bypasses audio_buffer sizing. Pass through
-        // unscaled rather than drop audio, and warn once so it is noticed.
+        // Reachable only via a caller that bypasses audio_buffer sizing. Pass
+        // through unscaled rather than drop audio, and warn once so it is noticed.
         static bool warned = false;
         if (!warned) {
             warned = true;

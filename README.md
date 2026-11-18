@@ -135,6 +135,24 @@ Once configured:
 - **WLED Sync**: FFT computation (Core 0) and UDP sender (Core 1) for audio-reactive lighting
 - **Timing Sync**: NTP-based synchronization for multi-room playback
 
+### Audio pipeline and mDNS tuning
+
+The RTP receive thread never decodes: it copies raw packets into a small SPSC
+queue and a separate decode task does ALAC work, so socket draining is never
+blocked by decoding. Priorities are set so RX outranks decode (see
+`components/esp-raop-receiver/src/rtp.c`).
+
+mDNS is the other half of staying connected: if the responder is starved it
+cannot answer the controllers' unicast SRV/A resolves and the device is dropped
+mid-playback. `sdkconfig.defaults.<target>` therefore raises
+`CONFIG_MDNS_TASK_PRIORITY` to the pthread default and pins the responder off
+core 0. If you change task priorities or affinity, keep mDNS schedulable or the
+"device disappears" symptom returns.
+
+Note: task stacks for the RTSP, search, and decode threads live in internal RAM
+(~35 KB of `.bss`), not PSRAM, because PSRAM stacks are unsafe here. This is a
+fixed cost, not per-session heap.
+
 ## Credits and Acknowledgments
 
 This project builds upon and incorporates code from:
@@ -167,7 +185,7 @@ This license was chosen to maintain compatibility with the GPL-licensed componen
 
 ### Memory Usage
 - **PSRAM**: ~2.7MB for audio buffers (RTP jitter buffer + ring buffer)
-- **DRAM**: ~180KB for code and data
+- **DRAM**: ~180KB total; ~35KB of that is permanent task stacks (`.bss`)
 - **Flash**: ~900KB application binary
 
 ### Network Requirements

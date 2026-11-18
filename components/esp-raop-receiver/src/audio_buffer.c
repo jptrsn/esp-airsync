@@ -52,7 +52,6 @@ static struct {
     uint32_t dropped_full;      // writes rejected because the ring was full
     uint32_t skip_total;        // frames dropped by timing correction
     uint32_t pause_total;       // silence frames inserted by timing correction
-    uint32_t last_log_ms;       // timestamp of last periodic health log
 } ab_stats = {0};
 
 // Hot-path scratch buffers kept off the audio_output_task stack. Three
@@ -70,6 +69,7 @@ static uint32_t gettime_ms(void) {
 // Underrun log throttle. File scope so audio_buffer_flush() can reset it with
 // the rest of the per-track diagnostics.
 static uint32_t last_underrun_ms = 0;
+static bool     in_underrun = false;   // edge latch: are we currently starved?
 
 static void audio_output_task(void *arg) {
     ESP_LOGD(TAG, "Audio output task started");
@@ -180,12 +180,19 @@ static void audio_output_task(void *arg) {
                 xSemaphoreGive(audio_buf.mutex);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
+            in_underrun = false;
         } else {
             // Ring drained while we are supposed to be playing: a playback
             // underrun (silence until the RTP producer refills it).
             xSemaphoreGive(audio_buf.mutex);
             uint32_t now_ms = gettime_ms();
-            ab_stats.underruns++;
+            // Count underruns edge-triggered: one per entry into the empty state,
+            // not one per 10ms retry (which inflates the counter), and log at most
+            // once a second while the gap persists.
+            if (!in_underrun) {
+                in_underrun = true;
+                ab_stats.underruns++;
+            }
             if (now_ms - last_underrun_ms > 1000) {
                 last_underrun_ms = now_ms;
                 ESP_LOGW(TAG, "UNDERRUN: ring empty while playing (count=%u)", ab_stats.underruns);
@@ -381,10 +388,9 @@ void audio_buffer_flush(void) {
     timing_correction.pause_frames = 0;
 
     // Reset per-track diagnostics so each track starts clean.
-    uint32_t keep_log_ms = ab_stats.last_log_ms;
     memset(&ab_stats, 0, sizeof(ab_stats));
-    ab_stats.last_log_ms = keep_log_ms;
     last_underrun_ms = 0;
+    in_underrun = false;
 
     ESP_LOGD(TAG, "Buffer flushed");
 }

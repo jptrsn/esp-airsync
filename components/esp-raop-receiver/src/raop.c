@@ -621,7 +621,9 @@ void cleanup_rtsp(raop_ctx_t *ctx, bool abort) {
 	}
 
 	if (ctx->active_remote.running) {
-		// need to make sure no search is on-going and reclaim task memory
+		// Stop the search thread and reclaim its (static) task storage. The
+		// destroy_mutex handshake lets it finish its current critical section;
+		// the stack/taskbuf are static so there is nothing to free here.
 		ctx->active_remote.running = false;
 		xSemaphoreTake(ctx->active_remote.destroy_mutex, portMAX_DELAY);
 		vTaskDelete(ctx->active_remote.thread);

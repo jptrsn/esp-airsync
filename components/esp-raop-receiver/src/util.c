@@ -94,17 +94,11 @@ int bind_socket(unsigned short *port, int mode)
 		return sock;
 	}
 
-	// Large receive buffer for UDP (RTP) so bursts of audio packets aren't
-	// dropped by lwIP before the RTP thread drains the socket. Without this,
-	// a sustained RTP flood overflows the default (small) buffer and can wedge
-	// the WiFi RX path.
-	if (mode == SOCK_DGRAM) {
-		int rcvbuf = 65536;
-		if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf))) {
-			// Requires CONFIG_LWIP_SO_RCVBUF; otherwise lwIP returns ENOPROTOOPT.
-			LOG_WARN("SO_RCVBUF not applied: %s", strerror(errno));
-		}
-	}
+	// No SO_RCVBUF here on purpose. In lwIP it caps the total buffered *bytes*
+	// for a netconn (recv_avail + p->tot_len > recv_bufsize drops the datagram),
+	// and the default cap is already INT_MAX -- setting it can only ever make
+	// things worse. The real burst limit is the per-socket receive mailbox,
+	// which is packet-count based; it is sized via CONFIG_LWIP_UDP_RECVMBOX_SIZE.
 
 	/*  Populate socket address structure  */
 	memset(&addr, 0, sizeof(addr));

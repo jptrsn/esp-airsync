@@ -5,16 +5,12 @@ CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-# mDNS must stay schedulable while streaming. The default priority of 1 leaves
-# the responder starved behind the RTP receive/decode tasks, so it cannot answer
-# unicast SRV/A resolves and controllers drop the device mid-playback. Keep it
-# level with the pthread default (decode runs one below that, RTP RX above it):
-# raising discovery above the audio path would only trade one starvation for
-# another.
-CONFIG_MDNS_TASK_PRIORITY=5
-# Dual-core targets only: on FREERTOS_UNICORE the CPU0 default applies and this
-# line is inert. Keeps the responder off the core 0 wiring of the BT/WiFi stack.
-CONFIG_MDNS_TASK_AFFINITY_CPU1=y
-# Required for SO_RCVBUF to be honoured on the RTP socket; without it lwIP
-# returns ENOPROTOOPT and the enlarged receive buffer silently does nothing.
-CONFIG_LWIP_SO_RCVBUF=y
+# mDNS priority/affinity live in the per-target defaults, because
+# CONFIG_MDNS_TASK_AFFINITY_CPU1 depends on !FREERTOS_UNICORE and would be
+# silently inert on a single-core target if placed here.
+# Per-socket UDP receive mailbox depth. This -- not SO_RCVBUF -- is what limits
+# how many RTP datagrams lwIP can queue for the RTP thread while it is between
+# select()/recvfrom() iterations; overflow here is a dropped audio packet. The
+# default of 6 can be exhausted by a WiFi-level burst, so raise it. Each slot is
+# one small pbuf, and only the ~3 RTP sockets use a deep mailbox.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16

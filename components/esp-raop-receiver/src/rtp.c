@@ -52,6 +52,7 @@
 #else
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "freertos/semphr.h"
 #include <mbedtls/version.h>
 #include <mbedtls/aes.h>
 #include "alac_wrapper.h"
@@ -80,11 +81,16 @@ extern log_level 	raop_loglevel;
 #define RTP_STACK_SIZE	(4*1024)
 #define RTP_STACK_WORDS	(RTP_STACK_SIZE / sizeof(StackType_t))
 
+// The decode thread gets a larger stack: ALAC decode plus the buffer_push_packet
+// path, which itself calls into the audio tap/volume callbacks.
+#define DECODE_STACK_SIZE	(8*1024)
+#define DECODE_STACK_WORDS	(DECODE_STACK_SIZE / sizeof(StackType_t))
+
 // RX must outrank decode so socket draining is never blocked by ALAC work,
 // and so the producer always wins the SPSC ring against the consumer. It stays
 // well below the lwIP/WiFi tasks, which continue to preempt it.
-#define RTP_RX_PRIORITY      (CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT + 5)
-#define RTP_DECODE_PRIORITY  (CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT - 1)
+#define RTP_RX_PRIORITY      (CONFIG_PTHREAD_TASK_PRIO_DEFAULT + 5)
+#define RTP_DECODE_PRIORITY  (CONFIG_PTHREAD_TASK_PRIO_DEFAULT - 1)
 
 #define RTP_SYNC	(0x01)
 #define NTP_SYNC	(0x02)
@@ -174,13 +180,17 @@ typedef struct rtp_s {
 	// Single-producer (RX thread) / single-consumer (decode thread): only the
 	// producer writes rawq_head and only the consumer writes rawq_tail, so the
 	// indices need no lock and the consumer is never advanced by the producer.
-	volatile int rawq_head, rawq_tail;
+	// Release/acquire on the index publish pairs the slot writes with the index
+	// store (see rawq_push / decode_thread_func); plain volatile would leave the
+	// payload's visibility to the compiler and Xtensa's weaker ordering.
+	int rawq_head, rawq_tail;
 	uint16_t rawq_overflows;
 	TaskHandle_t decode_thread;    // decode task; also the notify target
-	TaskHandle_t decode_joiner;    // set by rtp_end to wait for decode exit
+	// Decode-exit handshake. A semaphore, not a task notification: the joiner
+	// task is also poked by the RX thread's exit path, and xTaskNotifyGive's
+	// unconditional increment would let a stale count satisfy the decode join.
+	SemaphoreHandle_t decode_done;
 	StaticTask_t *decode_taskbuf;
-	#define DECODE_STACK_SIZE (8*1024)
-	#define DECODE_STACK_WORDS (DECODE_STACK_SIZE / sizeof(StackType_t))
 	StackType_t *decode_stack;
 } rtp_t;
 
@@ -376,12 +386,14 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	// and there is no benefit to confining it when the scheduler can balance.
 	ctx->decode_taskbuf = &s_decode_taskbuf;
 	ctx->decode_stack = s_decode_stack;
-	ctx->decode_joiner = NULL;
+	// Binary semaphore, given once by the decode thread just before it exits.
+	ctx->decode_done = xSemaphoreCreateBinary();
 	ctx->decode_thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) decode_thread_func, "ALAC_decode", DECODE_STACK_SIZE, ctx,
 																						RTP_DECODE_PRIORITY, ctx->decode_stack, ctx->decode_taskbuf,
 																						tskNO_AFFINITY);
-	if (!ctx->decode_thread) {
+	if (!ctx->decode_thread || !ctx->decode_done) {
 		LOG_ERROR("[%p]: cannot start decode thread", ctx);
+		ctx->decode_thread = NULL;
 	}
 #endif
 
@@ -407,13 +419,6 @@ void rtp_end(rtp_t *ctx)
 #if !defined WIN32
 		ctx->joiner = xTaskGetCurrentTaskHandle();
 #endif
-#ifndef WIN32
-		// Arm the decode joiner BEFORE clearing running: once running is false
-		// the decode thread may exit immediately, and if it saw a NULL joiner it
-		// would never notify us.
-		TaskHandle_t decode = ctx->decode_thread;
-		if (decode) ctx->decode_joiner = xTaskGetCurrentTaskHandle();
-#endif
 		ctx->running = false;
 #ifdef WIN32
 		pthread_join(ctx->thread, NULL);
@@ -421,18 +426,23 @@ void rtp_end(rtp_t *ctx)
 		ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
 		vTaskDelete(ctx->thread);
 		SAFE_PTR_FREE(ctx->xTaskBuffer);
-		// Join the decode thread before freeing ctx/rawq. A bounded wait
-		// followed by vTaskDelete() is not a join: vTaskDelete() returns before
-		// the task's storage is reclaimed and, worse, the decode thread may
-		// still be inside buffer_put_packet() touching ctx. Wait on the
-		// notification the decode thread sends just before it deletes itself.
+		// Join the decode thread before freeing ctx/rawq: it dereferences both,
+		// and vTaskDelete() on another task is not a join. Wait on the binary
+		// semaphore it gives just before deleting itself. Bounded, because the
+		// thread may be wedged inside buffer_put_packet() holding ab_mutex; on
+		// timeout we fall back to deleting it (leaking its static stack, which
+		// is preallocated, rather than hanging the whole teardown).
+		TaskHandle_t decode = ctx->decode_thread;
 		if (decode) {
-			// No poke here: the decode thread's own ulTaskNotifyTake() 100ms
-			// timeout makes it recheck running and exit. Signalling its handle
-			// would be unsafe if it had already self-deleted.
-			ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-			ctx->decode_joiner = NULL;
+			if (xSemaphoreTake(ctx->decode_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+				LOG_ERROR("[%p]: decode thread did not exit; forcing delete", ctx);
+				vTaskDelete(decode);
+			}
 			ctx->decode_thread = NULL;
+		}
+		if (ctx->decode_done) {
+			vSemaphoreDelete(ctx->decode_done);
+			ctx->decode_done = NULL;
 		}
 		// decode_taskbuf/decode_stack are static; do not free them.
 #endif
@@ -690,9 +700,9 @@ static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
                       const char *data, int len)
 {
 	if (len > MAX_PACKET) len = MAX_PACKET;
-	int head = ctx->rawq_head;
+	int head = __atomic_load_n(&ctx->rawq_head, __ATOMIC_RELAXED);
 	int next = (head + 1) % RAWQ_DEPTH;
-	if (next == ctx->rawq_tail) {
+	if (next == __atomic_load_n(&ctx->rawq_tail, __ATOMIC_ACQUIRE)) {
 		ctx->rawq_overflows++;
 		return;
 	}
@@ -702,7 +712,7 @@ static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
 	p->first = first ? 1 : 0;
 	p->len = len;
 	memcpy(p->data, data, len);
-	ctx->rawq_head = next;
+	__atomic_store_n(&ctx->rawq_head, next, __ATOMIC_RELEASE);
 	// Wake the consumer; it blocks on this notification instead of polling.
 	// A NULL handle only occurs if decode-thread creation failed (already
 	// logged at init), in which case nobody will ever drain this queue.
@@ -717,23 +727,31 @@ static void decode_thread_func(void *arg)
 	rtp_t *ctx = (rtp_t *)arg;
 	while (ctx->running) {
 		int tail = ctx->rawq_tail;
-		if (tail == ctx->rawq_head) {
+		if (tail == __atomic_load_n(&ctx->rawq_head, __ATOMIC_ACQUIRE)) {
 			// Timeout purely so a stop request is noticed promptly; the normal
 			// wake path is the producer's xTaskNotifyGive().
 			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 			continue;
 		}
 		struct raw_pkt *p = &ctx->rawq[tail];
-		// Decode + forward. buffer_put_packet copies what it needs and pushes.
-		buffer_put_packet(ctx, p->seqno, p->rtptime, p->first == 1,
-		                  (char *)p->data, p->len);
-		ctx->rawq_tail = (tail + 1) % RAWQ_DEPTH;
+		// Skip packets that a FLUSH has already rendered stale. buffer_put_packet
+		// applies the same gate under ab_mutex, so this is not load-bearing for
+		// correctness, but it avoids decoding up to RAWQ_DEPTH packets only to
+		// have them discarded -- the window the RX-thread design did not have.
+		int fence = __atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE);
+		if (fence == -1 || !seq_order(p->seqno, fence)) {
+			buffer_put_packet(ctx, p->seqno, p->rtptime, p->first == 1,
+			                  (char *)p->data, p->len);
+		}
+		__atomic_store_n(&ctx->rawq_tail, (tail + 1) % RAWQ_DEPTH, __ATOMIC_RELEASE);
+		// Let peers at this priority run: a drained 256-packet backlog must not
+		// monopolise a core through buffer_put_packet's per-packet ab_mutex.
+		taskYIELD();
 	}
-	// Release the joiner before exiting so rtp_end can safely free ctx/rawq.
+	// Signal exit before self-deleting so rtp_end can safely free ctx/rawq.
 	// decode_thread is owned by rtp_end here: clearing it from this task would
 	// open a window where rtp_end sees NULL and skips the join.
-	TaskHandle_t joiner = ctx->decode_joiner;
-	if (joiner) xTaskNotifyGive(joiner);
+	if (ctx->decode_done) xSemaphoreGive(ctx->decode_done);
 	vTaskDelete(NULL);
 }
 
