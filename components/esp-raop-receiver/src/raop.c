@@ -80,6 +80,12 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 						raop_cmd_cb_t cmd_cb, raop_data_cb_t data_cb,
 						raop_mdns_mode_t mdns_mode) {
 	struct raop_ctx_s *ctx = heap_caps_malloc(sizeof(struct raop_ctx_s), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	if (!ctx) {
+		// Internal DRAM too fragmented to hold the ~27KB struct (which embeds
+		// the 24KB RTSP + 3KB search-remote task stacks). Both threads are
+		// low-rate control loops, so a PSRAM-backed context is safe here.
+		ctx = heap_caps_malloc(sizeof(struct raop_ctx_s), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	}
 	struct sockaddr_in addr;
 	char id[64];
 
