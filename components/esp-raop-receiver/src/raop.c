@@ -30,7 +30,10 @@
 // raop_create may fall back to allocating the context from PSRAM when internal
 // DRAM is fragmented, and a task stack must never end up there: PSRAM is
 // unreachable while the flash cache is disabled (flash writes, OTA, NVS
-// commits), and CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY is not enabled.
+// commits). These are static arrays, so the linker always places them in
+// .dram0.bss -- internal RAM -- regardless of
+// CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM (which is y on esp32s3 and would
+// otherwise permit an externally-allocated stack).
 // raop is single-instance by design, so one static copy per stack suffices.
 static StaticTask_t s_rtsp_taskbuf;
 static StackType_t  s_rtsp_stack[RTSP_STACK_SIZE / sizeof(StackType_t)]

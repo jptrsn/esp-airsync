@@ -137,9 +137,9 @@ Once configured:
 
 ### Audio pipeline and mDNS tuning
 
-The RTP receive thread never decodes: it copies raw packets into a small SPSC
-queue and a separate decode task does ALAC work, so socket draining is never
-blocked by decoding. Priorities are set so RX outranks decode (see
+The RTP receive thread never decodes: it copies raw packets into a fixed
+256-packet (~360KB PSRAM) single-producer/single-consumer queue and a separate
+decode task does ALAC work, so socket draining is never blocked by decoding. Priorities are set so RX outranks decode (see
 `components/esp-raop-receiver/src/rtp.c`).
 
 mDNS is the other half of staying connected: if the responder is starved it
@@ -185,7 +185,8 @@ This license was chosen to maintain compatibility with the GPL-licensed componen
 
 ### Memory Usage
 - **PSRAM**: ~2.7MB for audio buffers (RTP jitter buffer + ring buffer)
-- **DRAM**: ~180KB total; ~35KB of that is permanent task stacks (`.bss`)
+- **DRAM**: ~85KB static (`.data` + `.bss`); ~35KB of that is permanent task
+  stacks. The rest of the internal-RAM budget is WiFi/lwIP runtime.
 - **Flash**: ~900KB application binary
 
 ### Network Requirements

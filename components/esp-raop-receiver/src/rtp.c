@@ -386,14 +386,19 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	// and there is no benefit to confining it when the scheduler can balance.
 	ctx->decode_taskbuf = &s_decode_taskbuf;
 	ctx->decode_stack = s_decode_stack;
-	// Binary semaphore, given once by the decode thread just before it exits.
+	// Create the binary semaphore BEFORE the task: the task may run immediately on
+	// creation and try to give it on exit, so it must already exist.
 	ctx->decode_done = xSemaphoreCreateBinary();
-	ctx->decode_thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) decode_thread_func, "ALAC_decode", DECODE_STACK_SIZE, ctx,
-																						RTP_DECODE_PRIORITY, ctx->decode_stack, ctx->decode_taskbuf,
-																						tskNO_AFFINITY);
-	if (!ctx->decode_thread || !ctx->decode_done) {
-		LOG_ERROR("[%p]: cannot start decode thread", ctx);
+	if (!ctx->decode_done) {
+		LOG_ERROR("[%p]: cannot create decode-done semaphore", ctx);
 		ctx->decode_thread = NULL;
+	} else {
+		ctx->decode_thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) decode_thread_func, "ALAC_decode", DECODE_STACK_SIZE, ctx,
+																							RTP_DECODE_PRIORITY, ctx->decode_stack, ctx->decode_taskbuf,
+																							tskNO_AFFINITY);
+		if (!ctx->decode_thread) {
+			LOG_ERROR("[%p]: cannot start decode thread", ctx);
+		}
 	}
 #endif
 
@@ -419,27 +424,27 @@ void rtp_end(rtp_t *ctx)
 #if !defined WIN32
 		ctx->joiner = xTaskGetCurrentTaskHandle();
 #endif
-		ctx->running = false;
+		__atomic_store_n(&ctx->running, false, __ATOMIC_RELEASE);
 #ifdef WIN32
 		pthread_join(ctx->thread, NULL);
 #else
 		ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
 		vTaskDelete(ctx->thread);
 		SAFE_PTR_FREE(ctx->xTaskBuffer);
-		// Join the decode thread before freeing ctx/rawq: it dereferences both,
-		// and vTaskDelete() on another task is not a join. Wait on the binary
-		// semaphore it gives just before deleting itself. Bounded, because the
-		// thread may be wedged inside buffer_put_packet() holding ab_mutex; on
-		// timeout we fall back to deleting it (leaking its static stack, which
-		// is preallocated, rather than hanging the whole teardown).
+		// Join the decode thread before freeing ctx/rawq: it dereferences both, and
+		// vTaskDelete() on another task is not a join. Wait on the binary semaphore
+		// it gives just before deleting itself. If it does not exit in time it is
+		// wedged (e.g. holding ab_mutex); we must then NOT free anything it may
+		// still touch -- no join means no safe free. Leak the whole session context
+		// (PSRAM) and report it rather than corrupt the heap or destroy a mutex the
+		// task still holds.
 		TaskHandle_t decode = ctx->decode_thread;
-		if (decode) {
-			if (xSemaphoreTake(ctx->decode_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
-				LOG_ERROR("[%p]: decode thread did not exit; forcing delete", ctx);
-				vTaskDelete(decode);
-			}
-			ctx->decode_thread = NULL;
+		if (decode && xSemaphoreTake(ctx->decode_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+			LOG_ERROR("[%p]: decode thread wedged in teardown; leaking session context "
+			          "(reboot recommended)", ctx);
+			return;
 		}
+		ctx->decode_thread = NULL;
 		if (ctx->decode_done) {
 			vSemaphoreDelete(ctx->decode_done);
 			ctx->decode_done = NULL;
@@ -475,7 +480,7 @@ bool rtp_flush(rtp_t *ctx, unsigned short seqno, unsigned int rtptime, bool exit
     pthread_mutex_lock(&ctx->ab_mutex);
 
     // always store flush seqno as we only want stricly above it, even when equal to RECORD
-    ctx->first_seqno = seqno;
+    __atomic_store_n(&ctx->first_seqno, seqno, __ATOMIC_RELEASE);
     bool flushed = false;
 
     // no need to stop playing if recent or equal to record - but first_seqno is needed
@@ -498,7 +503,7 @@ void rtp_flush_release(rtp_t *ctx) {
 
 /*---------------------------------------------------------------------------*/
 void rtp_record(rtp_t *ctx, unsigned short seqno, unsigned rtptime) {
-    ctx->first_seqno = (seqno || rtptime) ? seqno : -1;
+    __atomic_store_n(&ctx->first_seqno, (seqno || rtptime) ? seqno : -1, __ATOMIC_RELEASE);
 	ctx->state = RTP_WAIT;
 	LOG_DEBUG("[%p]: record %hu - %u", ctx, seqno, rtptime);
 }
@@ -594,7 +599,7 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 	 * state but we do have an allowed seqno and we should not accept any frame before we have it */
 
 	// if we have a pending first seqno and we are below, always ignore it
-	if (ctx->first_seqno != -1 && seq_order(seqno, ctx->first_seqno)) {
+	if (__atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE) != -1 && seq_order(seqno, __atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE))) {
 		pthread_mutex_unlock(&ctx->ab_mutex);
 		return;
 	}
@@ -606,14 +611,14 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 		if (ctx->first_seqno != -1) {
         	LOG_INFO("[%p]: 1st accepted packet:%d, now playing", ctx, seqno);
 			ctx->state = RTP_PLAY;
-			ctx->first_seqno = -1;
+			__atomic_store_n(&ctx->first_seqno, -1, __ATOMIC_RELEASE);
             u32_t playtime = ctx->synchro.time + ((rtptime - ctx->synchro.rtp) * 10) / (RAOP_SAMPLE_RATE / 100);
             ctx->cmd_cb(RAOP_INT_PLAY, playtime);
 		} else {
             ctx->state = RTP_STREAM;
 			LOG_INFO("[%p]: 1st accepted packet:%hu, waiting for FLUSH", ctx, seqno);
 		}
-	} else if (ctx->state == RTP_STREAM && ctx->first_seqno != -1 && seq_order(ctx->first_seqno, seqno + 1)) {
+	} else if (ctx->state == RTP_STREAM && __atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE) != -1 && seq_order(__atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE), seqno + 1)) {
 		// now we're talking, but first discard all packets with a seqno below first_seqno AND not ready
 		while (seq_order(ctx->ab_read, ctx->first_seqno) ||
 			!ctx->audio_buffer[BUFIDX(ctx->ab_read)].ready) {
@@ -622,7 +627,7 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 		}
         LOG_INFO("[%p]: done waiting for FLUSH with packet:%d, now playing starting:%hu", ctx, seqno, ctx->ab_read);
 		ctx->state = RTP_PLAY;
-		ctx->first_seqno = -1;
+		__atomic_store_n(&ctx->first_seqno, -1, __ATOMIC_RELEASE);
         u32_t playtime = ctx->synchro.time + ((rtptime - ctx->synchro.rtp) * 10) / (RAOP_SAMPLE_RATE / 100);
 		ctx->cmd_cb(RAOP_INT_PLAY, playtime);
 	}
@@ -725,8 +730,8 @@ static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
 static void decode_thread_func(void *arg)
 {
 	rtp_t *ctx = (rtp_t *)arg;
-	while (ctx->running) {
-		int tail = ctx->rawq_tail;
+	while (__atomic_load_n(&ctx->running, __ATOMIC_ACQUIRE)) {
+		int tail = __atomic_load_n(&ctx->rawq_tail, __ATOMIC_RELAXED);
 		if (tail == __atomic_load_n(&ctx->rawq_head, __ATOMIC_ACQUIRE)) {
 			// Timeout purely so a stop request is noticed promptly; the normal
 			// wake path is the producer's xTaskNotifyGive().
@@ -743,7 +748,7 @@ static void decode_thread_func(void *arg)
 			buffer_put_packet(ctx, p->seqno, p->rtptime, p->first == 1,
 			                  (char *)p->data, p->len);
 		}
-		__atomic_store_n(&ctx->rawq_tail, (tail + 1) % RAWQ_DEPTH, __ATOMIC_RELEASE);
+		__atomic_store_n(&ctx->rawq_tail, (tail + 1) % RAWQ_DEPTH, __ATOMIC_RELAXED);
 		// Let peers at this priority run: a drained 256-packet backlog must not
 		// monopolise a core through buffer_put_packet's per-packet ab_mutex.
 		taskYIELD();
@@ -847,7 +852,7 @@ static void rtp_thread_func(void *arg) {
 		ntp_sent = rtp_request_timing(ctx);
 	}
 
-	while (ctx->running) {
+	while (__atomic_load_n(&ctx->running, __ATOMIC_ACQUIRE)) {
 		ssize_t plen;
 		char type;
 		socklen_t rtp_client_len = sizeof(struct sockaddr_in);
@@ -864,10 +869,17 @@ static void rtp_thread_func(void *arg) {
 			if (rtp_last_log == 0 || now - rtp_last_log >= 5000) {
 				rtp_last_log = now;
 				UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+				// resent_*/silent/discarded are updated by the decode thread under
+				// ab_mutex; snapshot them under the same lock for a consistent read.
+				pthread_mutex_lock(&ctx->ab_mutex);
+				u32_t resent_req = ctx->resent_req, resent_rec = ctx->resent_rec;
+				u32_t silent = ctx->silent_frames, discarded = ctx->discarded;
+				seq_t ab_write = ctx->ab_write, ab_read = ctx->ab_read;
+				pthread_mutex_unlock(&ctx->ab_mutex);
 				LOG_INFO("[%p]: rtp health [W:%hu R:%hu] resent_req=%u resent_rec=%u "
-				         "silent=%u discarded=%u stack_hwm=%uB",
-				         ctx, ctx->ab_write, ctx->ab_read, ctx->resent_req,
-				         ctx->resent_rec, ctx->silent_frames, ctx->discarded,
+				         "silent=%u discarded=%u rawq_ovf=%u stack_hwm=%uB",
+				         ctx, ab_write, ab_read, resent_req,
+				         resent_rec, silent, discarded, ctx->rawq_overflows,
 				         (uint32_t)(hwm * sizeof(StackType_t)));
 			}
 		}
@@ -1087,9 +1099,17 @@ static bool rtp_request_resend(rtp_t *ctx, seq_t first, seq_t last) {
 	*(u16_t*)(req+4) = htons(first);  // missed seqnum
 	*(u16_t*)(req+6) = htons(last-first+1);  // count
 
-	ctx->rtp_host.sin_port = htons(ctx->rtp_sockets[CONTROL].rport);
+	// Build the destination locally: this now runs on the decode thread while the
+	// RX thread still owns rtp_host (recvfrom() writes it), so mutating the shared
+	// struct here would race. Mirror rtp_request_timing()'s local-copy approach.
+	struct sockaddr_in host;
+	if (ctx->host.s_addr != INADDR_ANY) {
+		host.sin_family = AF_INET;
+		host.sin_addr = ctx->host;
+	} else host = ctx->rtp_host;
+	host.sin_port = htons(ctx->rtp_sockets[CONTROL].rport);
 
-	if (sizeof(req) != sendto(ctx->rtp_sockets[CONTROL].sock, req, sizeof(req), MSG_DONTWAIT, (struct sockaddr*) &ctx->rtp_host, sizeof(ctx->rtp_host))) {
+	if (sizeof(req) != sendto(ctx->rtp_sockets[CONTROL].sock, req, sizeof(req), MSG_DONTWAIT, (struct sockaddr*) &host, sizeof(host))) {
 		LOG_WARN("[%p]: SENDTO failed (%s)", ctx, strerror(errno));
         return false;
 	}

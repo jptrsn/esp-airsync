@@ -69,6 +69,10 @@ static uint32_t gettime_ms(void) {
 // Underrun log throttle. File scope so audio_buffer_flush() can reset it with
 // the rest of the per-track diagnostics.
 static uint32_t last_underrun_ms = 0;
+// Cross-thread: written by the output task (set on starvation, clear on audio)
+// and by audio_buffer_flush() on the RTSP thread (clear per track). Use atomics
+// so the flush cannot clobber a concurrently-set latch without a lock; the
+// worst case is one spurious/missed count, never corruption.
 static bool     in_underrun = false;   // edge latch: are we currently starved?
 
 static void audio_output_task(void *arg) {
@@ -180,7 +184,7 @@ static void audio_output_task(void *arg) {
                 xSemaphoreGive(audio_buf.mutex);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
-            in_underrun = false;
+            __atomic_store_n(&in_underrun, false, __ATOMIC_RELAXED);
         } else {
             // Ring drained while we are supposed to be playing: a playback
             // underrun (silence until the RTP producer refills it).
@@ -189,8 +193,8 @@ static void audio_output_task(void *arg) {
             // Count underruns edge-triggered: one per entry into the empty state,
             // not one per 10ms retry (which inflates the counter), and log at most
             // once a second while the gap persists.
-            if (!in_underrun) {
-                in_underrun = true;
+            if (!__atomic_load_n(&in_underrun, __ATOMIC_RELAXED)) {
+                __atomic_store_n(&in_underrun, true, __ATOMIC_RELAXED);
                 ab_stats.underruns++;
             }
             if (now_ms - last_underrun_ms > 1000) {
@@ -347,9 +351,12 @@ bool audio_buffer_write(const uint8_t *data, size_t len, uint32_t playtime) {
 
     uint32_t next_write = (audio_buf.write_idx + 1) % BUFFER_FRAMES;
     if (next_write == audio_buf.read_idx) {
+        // Full: drop the incoming frame. Return false so the caller's
+        // "failed to buffer" telemetry reflects the drop (the frame was not
+        // stored) -- this is a drop, not a success.
         ab_stats.dropped_full++;
         xSemaphoreGive(audio_buf.mutex);
-        return true;
+        return false;
     }
 
     {
@@ -390,7 +397,7 @@ void audio_buffer_flush(void) {
     // Reset per-track diagnostics so each track starts clean.
     memset(&ab_stats, 0, sizeof(ab_stats));
     last_underrun_ms = 0;
-    in_underrun = false;
+    __atomic_store_n(&in_underrun, false, __ATOMIC_RELAXED);
 
     ESP_LOGD(TAG, "Buffer flushed");
 }

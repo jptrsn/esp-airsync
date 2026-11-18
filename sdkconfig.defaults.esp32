@@ -9,6 +9,10 @@ CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 
+# NOTE: keep this block identical to sdkconfig.defaults.esp32s3 (both targets are
+# dual-core). It is duplicated there because MDNS_TASK_AFFINITY_CPU1 depends on
+# !FREERTOS_UNICORE and must not sit in the shared sdkconfig.defaults.
+
 # mDNS must stay schedulable while streaming. The default priority of 1 leaves
 # the responder starved behind the RTP receive/decode tasks, so it cannot answer
 # unicast SRV/A resolves and controllers drop the device mid-playback. Keep it

@@ -9,8 +9,9 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # CONFIG_MDNS_TASK_AFFINITY_CPU1 depends on !FREERTOS_UNICORE and would be
 # silently inert on a single-core target if placed here.
 # Per-socket UDP receive mailbox depth. This -- not SO_RCVBUF -- is what limits
-# how many RTP datagrams lwIP can queue for the RTP thread while it is between
-# select()/recvfrom() iterations; overflow here is a dropped audio packet. The
-# default of 6 can be exhausted by a WiFi-level burst, so raise it. Each slot is
-# one small pbuf, and only the ~3 RTP sockets use a deep mailbox.
+# how many datagrams lwIP can queue for a socket between select()/recvfrom()
+# iterations; overflow here is a dropped audio packet. The default of 6 can be
+# exhausted by a WiFi-level burst, so raise it. It applies to every UDP netconn
+# (not just RTP); with CONFIG_LWIP_MAX_UDP_PCBS=16 the worst case is 16x16
+# slots of a pbuf pointer each, which is negligible.
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
