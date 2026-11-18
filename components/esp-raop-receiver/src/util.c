@@ -94,6 +94,15 @@ int bind_socket(unsigned short *port, int mode)
 		return sock;
 	}
 
+	// Large receive buffer for UDP (RTP) so bursts of audio packets aren't
+	// dropped by lwIP before the RTP thread drains the socket. Without this,
+	// a sustained RTP flood overflows the default (small) buffer and can wedge
+	// the WiFi RX path.
+	if (mode == SOCK_DGRAM) {
+		int rcvbuf = 65536;
+		setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+	}
+
 	/*  Populate socket address structure  */
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family      = AF_INET;
@@ -201,6 +210,8 @@ bool http_parse(int sock, char *method, key_data_t *rkd, char **body, int *len)
 		}
 		return false;
 	}
+
+	LOG_ERROR("RAWREQ line=[%s] i=%d", line, i);
 
 	if (!sscanf(line, "%s", method)) {
 		LOG_ERROR("missing method", NULL);
@@ -362,7 +373,9 @@ char *http_send(int sock, char *method, key_data_t *rkd)
 {
 	unsigned sent, len;
 	char *resp = kd_dump(rkd);
+	if (!resp) resp = strdup("\r\n");
 	char *data = malloc(strlen(method) + 2 + strlen(resp) + 2 + 1);
+	if (!data) { NFREE(resp); return NULL; }
 
 	len = sprintf(data, "%s\r\n%s\r\n", method, resp);
 	NFREE(resp);
@@ -434,7 +447,8 @@ char *kd_dump(key_data_t *kd)
 	// First pass: calculate total size needed
 	int total_size = 0;
 	while (kd[i].key) {
-		total_size += strlen(kd[i].key) + strlen(kd[i].data) + 4; // ": \r\n"
+		const char *d = kd[i].data ? kd[i].data : "";
+		total_size += strlen(kd[i].key) + strlen(d) + 4; // ": \r\n"
 		i++;
 	}
 
@@ -445,7 +459,7 @@ char *kd_dump(key_data_t *kd)
 	// Second pass: build string
 	i = 0;
 	while (kd[i].key) {
-		int len = sprintf(str + pos, "%s: %s\r\n", kd[i].key, kd[i].data);
+		int len = sprintf(str + pos, "%s: %s\r\n", kd[i].key, kd[i].data ? kd[i].data : "");
 		pos += len;
 		i++;
 	}

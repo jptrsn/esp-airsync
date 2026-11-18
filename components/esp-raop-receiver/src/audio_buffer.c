@@ -182,19 +182,23 @@ static void audio_output_task(void *arg) {
             // underrun (silence until the RTP producer refills it).
             xSemaphoreGive(audio_buf.mutex);
             uint32_t now_ms = gettime_ms();
-            if (now_ms - last_underrun_ms > 100) {
+            if (now_ms - last_underrun_ms > 1000) {
                 last_underrun_ms = now_ms;
                 ab_stats.underruns++;
                 ESP_LOGW(TAG, "UNDERRUN: ring empty while playing (count=%u)", ab_stats.underruns);
+            } else {
+                ab_stats.underruns++;
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
 
-        // Periodic health log: ring fill, counters, stack high-water mark.
+        // Periodic health log (diagnostics) - keep rare to avoid UART floods.
         {
+            static uint32_t s_last_health = 0;
             uint32_t now_ms = gettime_ms();
-            if (ab_stats.last_log_ms == 0 || now_ms - ab_stats.last_log_ms >= 5000) {
-                ab_stats.last_log_ms = now_ms;
+            if (s_last_health == 0) s_last_health = now_ms;
+            if (now_ms - s_last_health >= 30000) {
+                s_last_health = now_ms;
                 xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
                 uint32_t fill = (audio_buf.write_idx >= audio_buf.read_idx)
                     ? (audio_buf.write_idx - audio_buf.read_idx)
@@ -322,39 +326,36 @@ bool audio_buffer_write(const uint8_t *data, size_t len, uint32_t playtime) {
         return false;
     }
 
-    // Try up to 5 times with 10ms delays between attempts
-    for (int retries = 0; retries < 5; retries++) {
-        xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
+    // Called from the RTP receive thread. MUST NOT block: if we sleep here, the
+    // RTP socket stops draining and the WiFi RX path backs up, which cascades
+    // into massive packet loss. On a full ring, drop the oldest frame to make
+    // room (we're behind realtime anyway) instead of waiting.
+    int overflowed = 0;
+    xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
 
-        uint32_t next_write = (audio_buf.write_idx + 1) % BUFFER_FRAMES;
-
-        // Check if buffer has space
-        if (next_write != audio_buf.read_idx) {
-            audio_frame_t *frame = &audio_buf.frames[audio_buf.write_idx];
-            memcpy(frame->data, data, len);
-            frame->len = len;
-            frame->playtime = playtime;
-            frame->ready = true;
-            frame->tapped = false;
-
-            audio_buf.write_idx = next_write;
-            ab_stats.frames_written++;
-
-            xSemaphoreGive(audio_buf.mutex);
-            return true;
-        }
-
-        xSemaphoreGive(audio_buf.mutex);
-
-        // Buffer full, wait for I2S to drain
-        if (retries < 4) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
+    uint32_t next_write = (audio_buf.write_idx + 1) % BUFFER_FRAMES;
+    while (next_write == audio_buf.read_idx) {
+        // Drop the oldest frame to free space.
+        audio_buf.read_idx = (audio_buf.read_idx + 1) % BUFFER_FRAMES;
+        overflowed = 1;
+        next_write = (audio_buf.write_idx + 1) % BUFFER_FRAMES;
     }
 
-    ab_stats.dropped_full++;
-    ESP_LOGW(TAG, "Buffer full after retries, dropping frame (dropped_full=%u)", ab_stats.dropped_full);
-    return false;
+    {
+        audio_frame_t *frame = &audio_buf.frames[audio_buf.write_idx];
+        memcpy(frame->data, data, len);
+        frame->len = len;
+        frame->playtime = playtime;
+        frame->ready = true;
+        frame->tapped = false;
+
+        audio_buf.write_idx = next_write;
+        ab_stats.frames_written++;
+        if (overflowed) ab_stats.dropped_full++;
+    }
+
+    xSemaphoreGive(audio_buf.mutex);
+    return true;
 }
 
 void audio_buffer_flush(void) {

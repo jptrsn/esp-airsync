@@ -51,6 +51,7 @@
 #define MSG_DONTWAIT 0
 #else
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include <mbedtls/version.h>
 #include <mbedtls/aes.h>
 #include "alac_wrapper.h"
@@ -128,7 +129,7 @@ typedef struct rtp_s {
 	u32_t resent_req, resent_rec;	// total resent + recovered frames
 	u32_t silent_frames;	// total silence frames
 	u32_t discarded;
-	abuf_t audio_buffer[BUFFER_FRAMES_MAX];
+	abuf_t *audio_buffer;	// BUFFER_FRAMES_MAX entries, allocated from PSRAM
 	seq_t ab_read, ab_write;
 	pthread_mutex_t ab_mutex;
 #ifdef WIN32
@@ -146,14 +147,41 @@ typedef struct rtp_s {
 	raop_data_cb_t data_cb;
 	raop_cmd_cb_t cmd_cb;
 	uint8_t *user_buffer;
+
+	// ---- Raw-packet decode decoupling --------------------------------
+	// The RTP receive thread must never block on ALAC decode: doing so stalls
+	// socket draining and overflows WiFi RX (manifested as ~50% packet loss).
+	// Instead, the receive thread only copies raw audio packets into this SPSC
+	// queue, and a separate decode thread performs alac_decode + playtime
+	// forwarding in seqno order.
+	#define RAWQ_DEPTH 256
+	struct raw_pkt {
+		seq_t    seqno;
+		unsigned rtptime;
+		uint8_t  first;
+		int      len;
+		uint8_t  data[MAX_PACKET];
+	} *rawq;                       // RAWQ_DEPTH entries (PSRAM)
+	volatile int rawq_head, rawq_tail;  // producer=head, consumer=tail
+	uint16_t rawq_overflows;
+	TaskHandle_t decode_thread;
+	StaticTask_t *decode_taskbuf;
+	#define DECODE_STACK_SIZE (8*1024)
+	StackType_t *decode_stack;
 } rtp_t;
 
 
 #define BUFIDX(seqno) ((seq_t)(seqno) % buffer_frames)
+// Static decode-task storage (a single active RTP context at a time). Static
+// so starting the decode thread can never fail on internal-RAM exhaustion.
+static StaticTask_t s_decode_taskbuf;
+static StackType_t  s_decode_stack[8*1024] __attribute__ ((aligned (4)));
 static void 	buffer_alloc(abuf_t *audio_buffer, int size, uint8_t *buf, size_t buf_size);
 static void 	buffer_release(abuf_t *audio_buffer);
 static void 	buffer_reset(abuf_t *audio_buffer);
 static void 	buffer_push_packet(rtp_t *ctx);
+static void     decode_thread_func(void *arg);
+static void     rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first, const char *data, int len);
 static bool 	rtp_request_resend(rtp_t *ctx, seq_t first, seq_t last);
 static bool 	rtp_request_timing(rtp_t *ctx);
 static int	  	seq_order(seq_t a, seq_t b);
@@ -216,7 +244,47 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	rtp_t *ctx = heap_caps_calloc(1, sizeof(rtp_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	rtp_resp_t resp = { 0, 0, 0, NULL };
 
-	if (!ctx) return resp;
+	if (!ctx) {
+		LOG_ERROR("rtp_init: calloc rtp_t (%u bytes) from internal RAM failed; internal free=%u largest=%u",
+				  (unsigned)sizeof(rtp_t),
+				  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+				  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+		return resp;
+	}
+
+	// The decoded-frame ring (BUFFER_FRAMES_MAX * sizeof(abuf_t) ~= 25KB) is
+	// too large for the fragmented internal DRAM once the BT stack is up, so
+	// allocate it from PSRAM. Falls back to internal RAM if PSRAM is absent.
+	ctx->audio_buffer = heap_caps_calloc(BUFFER_FRAMES_MAX, sizeof(abuf_t),
+										 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!ctx->audio_buffer) {
+		ctx->audio_buffer = heap_caps_calloc(BUFFER_FRAMES_MAX, sizeof(abuf_t),
+											 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	}
+	if (!ctx->audio_buffer) {
+		LOG_ERROR("rtp_init: cannot allocate audio_buffer (%u entries); internal free=%u largest=%u spiram free=%u",
+				  (unsigned)BUFFER_FRAMES_MAX,
+				  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+				  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+				  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+		heap_caps_free(ctx);
+		return resp;
+	}
+
+	// Raw-packet queue for the decode thread (PSRAM; ~256 * 2KB ~= 512KB).
+	ctx->rawq = heap_caps_calloc(RAWQ_DEPTH, sizeof(struct raw_pkt),
+								 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!ctx->rawq) {
+		LOG_ERROR("rtp_init: cannot allocate rawq (%u bytes); spiram free=%u",
+				  (unsigned)(RAWQ_DEPTH * sizeof(struct raw_pkt)),
+				  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+		heap_caps_free(ctx->audio_buffer);
+		heap_caps_free(ctx);
+		return resp;
+	}
+	ctx->rawq_head = ctx->rawq_tail = 0;
+	ctx->rawq_overflows = 0;
+	ctx->decode_thread = NULL;
 
 	ctx->host = host;
 	ctx->decrypt = false;
@@ -281,8 +349,18 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	ctx->xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	BaseType_t core_id = (CONFIG_PTHREAD_TASK_CORE_DEFAULT == -1) ? tskNO_AFFINITY : CONFIG_PTHREAD_TASK_CORE_DEFAULT;
 	ctx->thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) rtp_thread_func, "RTP_thread", RTP_STACK_SIZE, ctx,
-																							CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT + 1, ctx->xStack, ctx->xTaskBuffer,
+																							CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT + 1 + 4, ctx->xStack, ctx->xTaskBuffer,
 																							core_id);
+
+	// Decode thread: ALAC decode + playtime forwarding, off the RX thread.
+	ctx->decode_taskbuf = &s_decode_taskbuf;
+	ctx->decode_stack = s_decode_stack;
+	ctx->decode_thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) decode_thread_func, "ALAC_decode", DECODE_STACK_SIZE, ctx,
+																						CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT, ctx->decode_stack, ctx->decode_taskbuf,
+																						0);
+	if (!ctx->decode_thread) {
+		LOG_ERROR("[%p]: cannot start decode thread", ctx);
+	}
 #endif
 
 	// cleanup everything if we failed
@@ -314,6 +392,15 @@ void rtp_end(rtp_t *ctx)
 		ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
 		vTaskDelete(ctx->thread);
 		SAFE_PTR_FREE(ctx->xTaskBuffer);
+		// Wait for the decode thread to drain the queue and exit.
+		for (int w = 0; w < 200 && ctx->decode_thread != NULL; w++) {
+			vTaskDelay(pdMS_TO_TICKS(5));
+		}
+		if (ctx->decode_thread != NULL) {
+			vTaskDelete(ctx->decode_thread);
+			ctx->decode_thread = NULL;
+		}
+		// decode_taskbuf/decode_stack are static; do not free them.
 #endif
 	}
 
@@ -326,6 +413,9 @@ void rtp_end(rtp_t *ctx)
 	buffer_release(ctx->audio_buffer);
 
 	if (ctx->user_buffer) free(ctx->user_buffer);
+
+	if (ctx->audio_buffer) heap_caps_free(ctx->audio_buffer);
+	if (ctx->rawq) heap_caps_free(ctx->rawq);
 
 	free(ctx);
 
@@ -554,6 +644,50 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 }
 
 /*---------------------------------------------------------------------------*/
+// Producer side (called from the RTP receive thread): enqueue a raw packet
+// without decoding. Never blocks; drops on overflow.
+static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
+                      const char *data, int len)
+{
+	if (len > MAX_PACKET) len = MAX_PACKET;
+	int head = ctx->rawq_head;
+	int next = (head + 1) % RAWQ_DEPTH;
+	if (next == ctx->rawq_tail) {
+		// Queue full: drop oldest to keep the receiver draining.
+		ctx->rawq_tail = (ctx->rawq_tail + 1) % RAWQ_DEPTH;
+		ctx->rawq_overflows++;
+	}
+	struct raw_pkt *p = &ctx->rawq[head];
+	p->seqno = seqno;
+	p->rtptime = rtptime;
+	p->first = first ? 1 : 0;
+	p->len = len;
+	memcpy(p->data, data, len);
+	ctx->rawq_head = next;
+}
+
+// Consumer side: decode task. Pulls raw packets in order, ALAC-decodes, and
+// runs the playtime/forwarding logic — off the RX thread.
+static void decode_thread_func(void *arg)
+{
+	rtp_t *ctx = (rtp_t *)arg;
+	while (ctx->running || ctx->rawq_tail != ctx->rawq_head) {
+		int tail = ctx->rawq_tail;
+		if (tail == ctx->rawq_head) {
+			vTaskDelay(pdMS_TO_TICKS(2));
+			continue;
+		}
+		struct raw_pkt *p = &ctx->rawq[tail];
+		// Decode + forward. buffer_put_packet copies what it needs and pushes.
+		buffer_put_packet(ctx, p->seqno, p->rtptime, p->first == 1,
+		                  (char *)p->data, p->len);
+		ctx->rawq_tail = (tail + 1) % RAWQ_DEPTH;
+	}
+	ctx->decode_thread = NULL;
+	vTaskDelete(NULL);
+}
+
+/*---------------------------------------------------------------------------*/
 // push as many frames as possible through callback
 static void buffer_push_packet(rtp_t *ctx) {
 	abuf_t *curframe = NULL;
@@ -728,7 +862,9 @@ static void rtp_thread_func(void *arg) {
 					LOG_INFO("[%p]: 1st audio packet received", ctx);
 				}
 
-				buffer_put_packet(ctx, seqno, rtptime, packet[1] & 0x80, pktp, plen);
+				// Enqueue raw packet for the decode thread; do NOT decode here
+				// (decode in the RX thread would stall socket draining).
+				rawq_push(ctx, seqno, rtptime, packet[1] & 0x80, pktp, plen);
 
 				break;
 			}
