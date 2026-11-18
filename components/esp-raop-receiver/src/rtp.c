@@ -75,7 +75,16 @@ extern log_level 	raop_loglevel;
 #define MIN_LATENCY		11025
 #define MAX_LATENCY   	( (120 * RAOP_SAMPLE_RATE * 2) / 100 )
 
+// Stacks are sized in BYTES (xTaskCreate* takes bytes), and the static stack
+// arrays are sized from these values, so the two can never drift apart.
 #define RTP_STACK_SIZE	(4*1024)
+#define RTP_STACK_WORDS	(RTP_STACK_SIZE / sizeof(StackType_t))
+
+// RX must outrank decode so socket draining is never blocked by ALAC work,
+// and so the producer always wins the SPSC ring against the consumer. It stays
+// well below the lwIP/WiFi tasks, which continue to preempt it.
+#define RTP_RX_PRIORITY      (CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT + 5)
+#define RTP_DECODE_PRIORITY  (CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT - 1)
 
 #define RTP_SYNC	(0x01)
 #define NTP_SYNC	(0x02)
@@ -137,7 +146,7 @@ typedef struct rtp_s {
 #else
 	TaskHandle_t thread, joiner;
 	StaticTask_t *xTaskBuffer;
-    StackType_t xStack[RTP_STACK_SIZE] __attribute__ ((aligned (4)));
+    StackType_t xStack[RTP_STACK_WORDS] __attribute__ ((aligned (4)));
 #endif
 
 	struct alac_codec_s *alac_codec;
@@ -162,11 +171,16 @@ typedef struct rtp_s {
 		int      len;
 		uint8_t  data[MAX_PACKET];
 	} *rawq;                       // RAWQ_DEPTH entries (PSRAM)
-	volatile int rawq_head, rawq_tail;  // producer=head, consumer=tail
+	// Single-producer (RX thread) / single-consumer (decode thread): only the
+	// producer writes rawq_head and only the consumer writes rawq_tail, so the
+	// indices need no lock and the consumer is never advanced by the producer.
+	volatile int rawq_head, rawq_tail;
 	uint16_t rawq_overflows;
-	TaskHandle_t decode_thread;
+	TaskHandle_t decode_thread;    // decode task; also the notify target
+	TaskHandle_t decode_joiner;    // set by rtp_end to wait for decode exit
 	StaticTask_t *decode_taskbuf;
 	#define DECODE_STACK_SIZE (8*1024)
+	#define DECODE_STACK_WORDS (DECODE_STACK_SIZE / sizeof(StackType_t))
 	StackType_t *decode_stack;
 } rtp_t;
 
@@ -174,8 +188,11 @@ typedef struct rtp_s {
 #define BUFIDX(seqno) ((seq_t)(seqno) % buffer_frames)
 // Static decode-task storage (a single active RTP context at a time). Static
 // so starting the decode thread can never fail on internal-RAM exhaustion.
+// StackType_t is 4 bytes on Xtensa, so the array must be sized in elements to
+// match the byte count handed to xTaskCreateStaticPinnedToCore().
 static StaticTask_t s_decode_taskbuf;
-static StackType_t  s_decode_stack[8*1024] __attribute__ ((aligned (4)));
+static StackType_t  s_decode_stack[DECODE_STACK_WORDS]
+                        __attribute__ ((aligned (4)));
 static void 	buffer_alloc(abuf_t *audio_buffer, int size, uint8_t *buf, size_t buf_size);
 static void 	buffer_release(abuf_t *audio_buffer);
 static void 	buffer_reset(abuf_t *audio_buffer);
@@ -271,7 +288,9 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 		return resp;
 	}
 
-	// Raw-packet queue for the decode thread (PSRAM; ~256 * 2KB ~= 512KB).
+	// Raw-packet queue for the decode thread. Sized from the struct so the figure
+	// cannot drift: RAWQ_DEPTH * sizeof(struct raw_pkt) (~352KB with MAX_PACKET
+	// 1408), allocated from PSRAM.
 	ctx->rawq = heap_caps_calloc(RAWQ_DEPTH, sizeof(struct raw_pkt),
 								 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!ctx->rawq) {
@@ -349,15 +368,18 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	ctx->xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	BaseType_t core_id = (CONFIG_PTHREAD_TASK_CORE_DEFAULT == -1) ? tskNO_AFFINITY : CONFIG_PTHREAD_TASK_CORE_DEFAULT;
 	ctx->thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) rtp_thread_func, "RTP_thread", RTP_STACK_SIZE, ctx,
-																							CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT + 1 + 4, ctx->xStack, ctx->xTaskBuffer,
+																							RTP_RX_PRIORITY, ctx->xStack, ctx->xTaskBuffer,
 																							core_id);
 
 	// Decode thread: ALAC decode + playtime forwarding, off the RX thread.
+	// Unpinned: hard-pinning it to core 0 is what starved the mDNS responder,
+	// and there is no benefit to confining it when the scheduler can balance.
 	ctx->decode_taskbuf = &s_decode_taskbuf;
 	ctx->decode_stack = s_decode_stack;
+	ctx->decode_joiner = NULL;
 	ctx->decode_thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) decode_thread_func, "ALAC_decode", DECODE_STACK_SIZE, ctx,
-																						CONFIG_ESP32_PTHREAD_TASK_PRIO_DEFAULT, ctx->decode_stack, ctx->decode_taskbuf,
-																						0);
+																						RTP_DECODE_PRIORITY, ctx->decode_stack, ctx->decode_taskbuf,
+																						tskNO_AFFINITY);
 	if (!ctx->decode_thread) {
 		LOG_ERROR("[%p]: cannot start decode thread", ctx);
 	}
@@ -385,6 +407,13 @@ void rtp_end(rtp_t *ctx)
 #if !defined WIN32
 		ctx->joiner = xTaskGetCurrentTaskHandle();
 #endif
+#ifndef WIN32
+		// Arm the decode joiner BEFORE clearing running: once running is false
+		// the decode thread may exit immediately, and if it saw a NULL joiner it
+		// would never notify us.
+		TaskHandle_t decode = ctx->decode_thread;
+		if (decode) ctx->decode_joiner = xTaskGetCurrentTaskHandle();
+#endif
 		ctx->running = false;
 #ifdef WIN32
 		pthread_join(ctx->thread, NULL);
@@ -392,12 +421,17 @@ void rtp_end(rtp_t *ctx)
 		ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
 		vTaskDelete(ctx->thread);
 		SAFE_PTR_FREE(ctx->xTaskBuffer);
-		// Wait for the decode thread to drain the queue and exit.
-		for (int w = 0; w < 200 && ctx->decode_thread != NULL; w++) {
-			vTaskDelay(pdMS_TO_TICKS(5));
-		}
-		if (ctx->decode_thread != NULL) {
-			vTaskDelete(ctx->decode_thread);
+		// Join the decode thread before freeing ctx/rawq. A bounded wait
+		// followed by vTaskDelete() is not a join: vTaskDelete() returns before
+		// the task's storage is reclaimed and, worse, the decode thread may
+		// still be inside buffer_put_packet() touching ctx. Wait on the
+		// notification the decode thread sends just before it deletes itself.
+		if (decode) {
+			// No poke here: the decode thread's own ulTaskNotifyTake() 100ms
+			// timeout makes it recheck running and exit. Signalling its handle
+			// would be unsafe if it had already self-deleted.
+			ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+			ctx->decode_joiner = NULL;
 			ctx->decode_thread = NULL;
 		}
 		// decode_taskbuf/decode_stack are static; do not free them.
@@ -645,7 +679,13 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 
 /*---------------------------------------------------------------------------*/
 // Producer side (called from the RTP receive thread): enqueue a raw packet
-// without decoding. Never blocks; drops on overflow.
+// without decoding. Never blocks; drops the NEW packet on overflow.
+//
+// Dropping the new packet (rather than the oldest) is deliberate: the oldest is
+// owned by the consumer, and advancing rawq_tail from here would be a
+// cross-thread read-modify-write on a consumer-owned index. The decoded audio
+// was never going to arrive in time anyway, and buffer_put_packet reorders by
+// seqno and requests resends, so dropping the newest is harmless.
 static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
                       const char *data, int len)
 {
@@ -653,9 +693,8 @@ static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
 	int head = ctx->rawq_head;
 	int next = (head + 1) % RAWQ_DEPTH;
 	if (next == ctx->rawq_tail) {
-		// Queue full: drop oldest to keep the receiver draining.
-		ctx->rawq_tail = (ctx->rawq_tail + 1) % RAWQ_DEPTH;
 		ctx->rawq_overflows++;
+		return;
 	}
 	struct raw_pkt *p = &ctx->rawq[head];
 	p->seqno = seqno;
@@ -664,17 +703,24 @@ static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
 	p->len = len;
 	memcpy(p->data, data, len);
 	ctx->rawq_head = next;
+	// Wake the consumer; it blocks on this notification instead of polling.
+	// A NULL handle only occurs if decode-thread creation failed (already
+	// logged at init), in which case nobody will ever drain this queue.
+	if (ctx->decode_thread) xTaskNotifyGive(ctx->decode_thread);
 }
 
 // Consumer side: decode task. Pulls raw packets in order, ALAC-decodes, and
-// runs the playtime/forwarding logic — off the RX thread.
+// runs the playtime/forwarding logic — off the RX thread. Blocks on a task
+// notification when the queue is empty, so it is never spuriously runnable.
 static void decode_thread_func(void *arg)
 {
 	rtp_t *ctx = (rtp_t *)arg;
-	while (ctx->running || ctx->rawq_tail != ctx->rawq_head) {
+	while (ctx->running) {
 		int tail = ctx->rawq_tail;
 		if (tail == ctx->rawq_head) {
-			vTaskDelay(pdMS_TO_TICKS(2));
+			// Timeout purely so a stop request is noticed promptly; the normal
+			// wake path is the producer's xTaskNotifyGive().
+			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 			continue;
 		}
 		struct raw_pkt *p = &ctx->rawq[tail];
@@ -683,7 +729,11 @@ static void decode_thread_func(void *arg)
 		                  (char *)p->data, p->len);
 		ctx->rawq_tail = (tail + 1) % RAWQ_DEPTH;
 	}
-	ctx->decode_thread = NULL;
+	// Release the joiner before exiting so rtp_end can safely free ctx/rawq.
+	// decode_thread is owned by rtp_end here: clearing it from this task would
+	// open a window where rtp_end sees NULL and skips the join.
+	TaskHandle_t joiner = ctx->decode_joiner;
+	if (joiner) xTaskNotifyGive(joiner);
 	vTaskDelete(NULL);
 }
 

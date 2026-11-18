@@ -6,10 +6,15 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # mDNS must stay schedulable while streaming. The default priority of 1 leaves
-# the responder starved behind the RTP RX and ALAC decode tasks, so it cannot
-# answer unicast SRV/A resolves and controllers drop the device mid-playback.
-CONFIG_MDNS_TASK_PRIORITY=6
-# Keep mDNS off core 0, which hosts the ALAC decode task.
-# CONFIG_MDNS_TASK_AFFINITY_NO_AFFINITY is not set
-# CONFIG_MDNS_TASK_AFFINITY_CPU0 is not set
+# the responder starved behind the RTP receive/decode tasks, so it cannot answer
+# unicast SRV/A resolves and controllers drop the device mid-playback. Keep it
+# level with the pthread default (decode runs one below that, RTP RX above it):
+# raising discovery above the audio path would only trade one starvation for
+# another.
+CONFIG_MDNS_TASK_PRIORITY=5
+# Dual-core targets only: on FREERTOS_UNICORE the CPU0 default applies and this
+# line is inert. Keeps the responder off the core 0 wiring of the BT/WiFi stack.
 CONFIG_MDNS_TASK_AFFINITY_CPU1=y
+# Required for SO_RCVBUF to be honoured on the RTP socket; without it lwIP
+# returns ENOPROTOOPT and the enlarged receive buffer silently does nothing.
+CONFIG_LWIP_SO_RCVBUF=y

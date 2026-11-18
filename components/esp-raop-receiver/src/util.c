@@ -100,7 +100,10 @@ int bind_socket(unsigned short *port, int mode)
 	// the WiFi RX path.
 	if (mode == SOCK_DGRAM) {
 		int rcvbuf = 65536;
-		setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+		if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf))) {
+			// Requires CONFIG_LWIP_SO_RCVBUF; otherwise lwIP returns ENOPROTOOPT.
+			LOG_WARN("SO_RCVBUF not applied: %s", strerror(errno));
+		}
 	}
 
 	/*  Populate socket address structure  */
@@ -211,7 +214,7 @@ bool http_parse(int sock, char *method, key_data_t *rkd, char **body, int *len)
 		return false;
 	}
 
-	LOG_ERROR("RAWREQ line=[%s] i=%d", line, i);
+	LOG_SDEBUG("RAWREQ line=[%s] i=%d", line, i);
 
 	if (!sscanf(line, "%s", method)) {
 		LOG_ERROR("missing method", NULL);
@@ -373,7 +376,10 @@ char *http_send(int sock, char *method, key_data_t *rkd)
 {
 	unsigned sent, len;
 	char *resp = kd_dump(rkd);
-	if (!resp) resp = strdup("\r\n");
+	if (!resp) {
+		resp = strdup("\r\n");
+		if (!resp) return NULL;
+	}
 	char *data = malloc(strlen(method) + 2 + strlen(resp) + 2 + 1);
 	if (!data) { NFREE(resp); return NULL; }
 

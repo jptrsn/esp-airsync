@@ -67,9 +67,12 @@ static uint32_t gettime_ms(void) {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
+// Underrun log throttle. File scope so audio_buffer_flush() can reset it with
+// the rest of the per-track diagnostics.
+static uint32_t last_underrun_ms = 0;
+
 static void audio_output_task(void *arg) {
     ESP_LOGD(TAG, "Audio output task started");
-    static uint32_t last_underrun_ms = 0;
 
     while (audio_buf.running) {
         // Wait until we have a start time
@@ -182,12 +185,10 @@ static void audio_output_task(void *arg) {
             // underrun (silence until the RTP producer refills it).
             xSemaphoreGive(audio_buf.mutex);
             uint32_t now_ms = gettime_ms();
+            ab_stats.underruns++;
             if (now_ms - last_underrun_ms > 1000) {
                 last_underrun_ms = now_ms;
-                ab_stats.underruns++;
                 ESP_LOGW(TAG, "UNDERRUN: ring empty while playing (count=%u)", ab_stats.underruns);
-            } else {
-                ab_stats.underruns++;
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
@@ -328,17 +329,20 @@ bool audio_buffer_write(const uint8_t *data, size_t len, uint32_t playtime) {
 
     // Called from the RTP receive thread. MUST NOT block: if we sleep here, the
     // RTP socket stops draining and the WiFi RX path backs up, which cascades
-    // into massive packet loss. On a full ring, drop the oldest frame to make
-    // room (we're behind realtime anyway) instead of waiting.
-    int overflowed = 0;
+    // into massive packet loss. On a full ring, drop the INCOMING frame instead
+    // of waiting (we're behind realtime anyway).
+    //
+    // Dropping the incoming frame, not the oldest, keeps read_idx owned solely
+    // by the consumer task: advancing it here from the producer would be a
+    // cross-task mutation of the consumer's cursor while it is scheduling the
+    // frame to play.
     xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
 
     uint32_t next_write = (audio_buf.write_idx + 1) % BUFFER_FRAMES;
-    while (next_write == audio_buf.read_idx) {
-        // Drop the oldest frame to free space.
-        audio_buf.read_idx = (audio_buf.read_idx + 1) % BUFFER_FRAMES;
-        overflowed = 1;
-        next_write = (audio_buf.write_idx + 1) % BUFFER_FRAMES;
+    if (next_write == audio_buf.read_idx) {
+        ab_stats.dropped_full++;
+        xSemaphoreGive(audio_buf.mutex);
+        return true;
     }
 
     {
@@ -351,7 +355,6 @@ bool audio_buffer_write(const uint8_t *data, size_t len, uint32_t playtime) {
 
         audio_buf.write_idx = next_write;
         ab_stats.frames_written++;
-        if (overflowed) ab_stats.dropped_full++;
     }
 
     xSemaphoreGive(audio_buf.mutex);
@@ -381,6 +384,7 @@ void audio_buffer_flush(void) {
     uint32_t keep_log_ms = ab_stats.last_log_ms;
     memset(&ab_stats, 0, sizeof(ab_stats));
     ab_stats.last_log_ms = keep_log_ms;
+    last_underrun_ms = 0;
 
     ESP_LOGD(TAG, "Buffer flushed");
 }

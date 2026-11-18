@@ -26,6 +26,19 @@
 #define RTSP_STACK_SIZE 	(24*1024)
 #define SEARCH_STACK_SIZE	(3*1024)
 
+// Task stacks live in static internal RAM rather than inline in raop_ctx_s.
+// raop_create may fall back to allocating the context from PSRAM when internal
+// DRAM is fragmented, and a task stack must never end up there: PSRAM is
+// unreachable while the flash cache is disabled (flash writes, OTA, NVS
+// commits), and CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY is not enabled.
+// raop is single-instance by design, so one static copy per stack suffices.
+static StaticTask_t s_rtsp_taskbuf;
+static StackType_t  s_rtsp_stack[RTSP_STACK_SIZE / sizeof(StackType_t)]
+                        __attribute__ ((aligned (4)));
+static StaticTask_t s_search_taskbuf;
+static StackType_t  s_search_stack[SEARCH_STACK_SIZE / sizeof(StackType_t)]
+                        __attribute__ ((aligned (4)));
+
 typedef struct raop_ctx_s {
 	struct in_addr host;	// IP of bridge
 	short unsigned port;    // RTSP port for RAOP
@@ -34,7 +47,7 @@ typedef struct raop_ctx_s {
 	bool running;
 	TaskHandle_t thread, joiner;
 	StaticTask_t *xTaskBuffer;
-	StackType_t xStack[RTSP_STACK_SIZE] __attribute__ ((aligned (4)));
+	StackType_t *xStack;    // static internal RAM, see s_rtsp_stack
 	bool abort;
 	unsigned char mac[6];
 	int latency;
@@ -52,7 +65,7 @@ typedef struct raop_ctx_s {
 		bool running;
 		TaskHandle_t thread;
 		StaticTask_t *xTaskBuffer;
-		StackType_t xStack[SEARCH_STACK_SIZE] __attribute__ ((aligned (4)));;
+		StackType_t *xStack;    // static internal RAM, see s_search_stack
 		SemaphoreHandle_t destroy_mutex;
 	} active_remote;
 	void *owner;
@@ -81,11 +94,18 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 						raop_mdns_mode_t mdns_mode) {
 	struct raop_ctx_s *ctx = heap_caps_malloc(sizeof(struct raop_ctx_s), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	if (!ctx) {
-		// Internal DRAM too fragmented to hold the ~27KB struct (which embeds
-		// the 24KB RTSP + 3KB search-remote task stacks). Both threads are
-		// low-rate control loops, so a PSRAM-backed context is safe here.
-		ctx = heap_caps_malloc(sizeof(struct raop_ctx_s), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		// Internal DRAM too fragmented to hold the context. It no longer embeds
+		// the RTSP / search-remote task stacks (they are static internal RAM),
+		// so what falls back to PSRAM here is only the control block. Both
+		// threads are low-rate control loops, so that is safe; the stacks
+		// themselves must never be in PSRAM.
+		ctx = heap_caps_calloc(1, sizeof(struct raop_ctx_s), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	}
+	if (!ctx) return NULL;
+	ctx->xStack = s_rtsp_stack;
+	ctx->xTaskBuffer = &s_rtsp_taskbuf;
+	ctx->active_remote.xStack = s_search_stack;
+	ctx->active_remote.xTaskBuffer = &s_search_taskbuf;
 	struct sockaddr_in addr;
 	char id[64];
 
@@ -147,9 +167,9 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 		LOG_INFO("mDNS external mode - service registration skipped for %s", id);
 	}
 
-  ctx->xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	BaseType_t core_id = (CONFIG_PTHREAD_TASK_CORE_DEFAULT == -1) ? tskNO_AFFINITY : CONFIG_PTHREAD_TASK_CORE_DEFAULT;
-	ctx->thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) rtsp_thread, "RTSP", RTSP_STACK_SIZE, ctx,
+	ctx->thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) rtsp_thread, "RTSP",
+                                             sizeof(s_rtsp_stack), ctx,
                                              ESP_TASK_PRIO_MIN + 2, ctx->xStack, ctx->xTaskBuffer,
                                              core_id);
 
@@ -178,7 +198,7 @@ void raop_delete(struct raop_ctx_s *ctx) {
 	vTaskDelay(100 / portTICK_PERIOD_MS);
 	ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
 	vTaskDelete(ctx->thread);
-	if (ctx->xTaskBuffer) free(ctx->xTaskBuffer);
+	// xTaskBuffer is static internal RAM; do not free it.
 
 	// cleanup all session-created items
 	cleanup_rtsp(ctx, true);
@@ -451,8 +471,7 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 
 		ctx->active_remote.running = true;
 		ctx->active_remote.destroy_mutex = xSemaphoreCreateBinary();
-		ctx->active_remote.xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-		ctx->active_remote.thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) search_remote, "search_remote", SEARCH_STACK_SIZE, ctx,
+		ctx->active_remote.thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) search_remote, "search_remote", sizeof(s_search_stack), ctx,
                                                             ESP_TASK_PRIO_MIN + 2, ctx->active_remote.xStack, ctx->active_remote.xTaskBuffer,
                                                             tskNO_AFFINITY );
 
@@ -606,9 +625,11 @@ void cleanup_rtsp(raop_ctx_t *ctx, bool abort) {
 		ctx->active_remote.running = false;
 		xSemaphoreTake(ctx->active_remote.destroy_mutex, portMAX_DELAY);
 		vTaskDelete(ctx->active_remote.thread);
-		if (ctx->active_remote.xTaskBuffer) free(ctx->active_remote.xTaskBuffer);
+		// active_remote.xTaskBuffer is static internal RAM; do not free it.
 		vSemaphoreDelete(ctx->active_remote.destroy_mutex);
 		memset(&ctx->active_remote, 0, sizeof(ctx->active_remote));
+		ctx->active_remote.xStack = s_search_stack;
+		ctx->active_remote.xTaskBuffer = &s_search_taskbuf;
 		LOG_INFO("[%p]: Remote search thread aborted", ctx);
 	}
 

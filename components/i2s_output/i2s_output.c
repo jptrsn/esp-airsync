@@ -96,8 +96,16 @@ void i2s_output_write(const uint8_t *data, size_t len)
     // and the WiFi stack (which manifests as total packet loss).
     #define VOLUME_BUF_MAX 2048
     static int16_t volume_buf[VOLUME_BUF_MAX / sizeof(int16_t)];
+    // audio_buffer caps frames at MAX_FRAME_SIZE == 2048 (see audio_buffer.c),
+    // so with this scratch sized to match, the pass-through below is unreachable.
     if (len > sizeof(volume_buf)) {
-        // Frame too large for scratch: pass through unscaled rather than fail.
+        // Only reachable if a caller bypasses audio_buffer sizing. Pass through
+        // unscaled rather than drop audio, and warn once so it is noticed.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            ESP_LOGW(TAG, "frame %u > volume scratch, volume not applied", (unsigned)len);
+        }
         size_t _w = 0;
         i2s_channel_write(tx_handle, data, len, &_w, portMAX_DELAY);
         return;
