@@ -308,9 +308,10 @@ void audio_buffer_start(void) {
         }
     }
 
-    // Drain any stale token left by a prior stop that had to force-delete the task
-    // (the task may have given done just before being deleted), so the next stop
-    // cannot be satisfied by a token from the previous session.
+    // Defensive drain: on the normal path stop() consumes the token before
+    // clearing task, and the leak path leaves task set so we return just above.
+    // Clearing any stray token here costs nothing and guarantees the next stop()
+    // cannot be satisfied by a token from a previous session.
     xSemaphoreTake(audio_buf.done, 0);
 
     __atomic_store_n(&audio_buf.running, true, __ATOMIC_RELEASE);
@@ -446,7 +447,11 @@ void audio_buffer_flush(void) {
     timing_correction.skip_frames = 0;
     timing_correction.pause_frames = 0;
 
-    // Reset per-track diagnostics so each track starts clean.
+    // Reset per-track diagnostics so each track starts clean. This runs on the
+    // RTSP thread while the output task may still increment these counters; on
+    // Xtensa the 32-bit writes are independent, so this is at worst a lost or
+    // spurious diagnostic count for one instant, never corruption. in_underrun is
+    // the one field with cross-thread semantics, so it is reset atomically.
     memset(&ab_stats, 0, sizeof(ab_stats));
     last_underrun_ms = 0;
     __atomic_store_n(&in_underrun, false, __ATOMIC_RELAXED);
