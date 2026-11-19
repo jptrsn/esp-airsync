@@ -584,7 +584,10 @@ static void buffer_alloc(abuf_t *audio_buffer, int size, uint8_t *buf, size_t bu
 /*---------------------------------------------------------------------------*/
 static void buffer_release(abuf_t *audio_buffer) {
 	int i;
-	for (i = 0; i < buffer_frames; i++) {
+	// Iterate the allocation length, not the mutable buffer_frames static: after a
+	// failed init that never reached buffer_alloc(), buffer_frames may still hold
+	// a previous session's value, which could walk past this allocation.
+	for (i = 0; i < BUFFER_FRAMES_MAX; i++) {
 		if (audio_buffer[i].allocated) free(audio_buffer[i].data);
 	}
 }
@@ -592,7 +595,7 @@ static void buffer_release(abuf_t *audio_buffer) {
 /*---------------------------------------------------------------------------*/
 static void buffer_reset(abuf_t *audio_buffer) {
 	int i;
-	for (i = 0; i < buffer_frames; i++) audio_buffer[i].ready = 0;
+	for (i = 0; i < BUFFER_FRAMES_MAX; i++) audio_buffer[i].ready = 0;
 }
 
 /*---------------------------------------------------------------------------*/
