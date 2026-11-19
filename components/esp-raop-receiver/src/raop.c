@@ -25,6 +25,9 @@
 
 #define RTSP_STACK_SIZE 	(24*1024)
 #define SEARCH_STACK_SIZE	(3*1024)
+// xTaskCreateStatic* takes an element count of StackType_t, not bytes.
+#define RTSP_STACK_WORDS	(RTSP_STACK_SIZE / sizeof(StackType_t))
+#define SEARCH_STACK_WORDS	(SEARCH_STACK_SIZE / sizeof(StackType_t))
 
 // Task stacks live in static internal RAM rather than inline in raop_ctx_s.
 // raop_create may fall back to allocating the context from PSRAM when internal
@@ -36,10 +39,10 @@
 // otherwise permit an externally-allocated stack).
 // raop is single-instance by design, so one static copy per stack suffices.
 static StaticTask_t s_rtsp_taskbuf;
-static StackType_t  s_rtsp_stack[RTSP_STACK_SIZE / sizeof(StackType_t)]
+static StackType_t  s_rtsp_stack[RTSP_STACK_WORDS]
                         __attribute__ ((aligned (4)));
 static StaticTask_t s_search_taskbuf;
-static StackType_t  s_search_stack[SEARCH_STACK_SIZE / sizeof(StackType_t)]
+static StackType_t  s_search_stack[SEARCH_STACK_WORDS]
                         __attribute__ ((aligned (4)));
 
 typedef struct raop_ctx_s {
@@ -105,10 +108,6 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 		ctx = heap_caps_calloc(1, sizeof(struct raop_ctx_s), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	}
 	if (!ctx) return NULL;
-	ctx->xStack = s_rtsp_stack;
-	ctx->xTaskBuffer = &s_rtsp_taskbuf;
-	ctx->active_remote.xStack = s_search_stack;
-	ctx->active_remote.xTaskBuffer = &s_search_taskbuf;
 	struct sockaddr_in addr;
 	char id[64];
 
@@ -132,6 +131,13 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 
 	// make sure we have a clean context
 	memset(ctx, 0, sizeof(raop_ctx_t));
+
+	// Static task storage pointers must be (re)assigned AFTER the memset, which
+	// would otherwise zero them and make the static task creates fail.
+	ctx->xStack = s_rtsp_stack;
+	ctx->xTaskBuffer = &s_rtsp_taskbuf;
+	ctx->active_remote.xStack = s_search_stack;
+	ctx->active_remote.xTaskBuffer = &s_search_taskbuf;
 
 	ctx->host.s_addr = host;
 	ctx->sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -172,7 +178,7 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 
 	BaseType_t core_id = (CONFIG_PTHREAD_TASK_CORE_DEFAULT == -1) ? tskNO_AFFINITY : CONFIG_PTHREAD_TASK_CORE_DEFAULT;
 	ctx->thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) rtsp_thread, "RTSP",
-                                             sizeof(s_rtsp_stack), ctx,
+                                             RTSP_STACK_WORDS, ctx,
                                              ESP_TASK_PRIO_MIN + 2, ctx->xStack, ctx->xTaskBuffer,
                                              core_id);
 
@@ -472,11 +478,22 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		if ((buf = kd_lookup(headers, "DACP-ID")) != NULL) strcpy(ctx->active_remote.DACPid, buf);
 		if ((buf = kd_lookup(headers, "Active-Remote")) != NULL) strcpy(ctx->active_remote.id, buf);
 
-		ctx->active_remote.running = true;
 		ctx->active_remote.destroy_mutex = xSemaphoreCreateBinary();
-		ctx->active_remote.thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) search_remote, "search_remote", sizeof(s_search_stack), ctx,
+		ctx->active_remote.thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) search_remote, "search_remote", SEARCH_STACK_WORDS, ctx,
                                                             ESP_TASK_PRIO_MIN + 2, ctx->active_remote.xStack, ctx->active_remote.xTaskBuffer,
                                                             tskNO_AFFINITY );
+		if (ctx->active_remote.thread && ctx->active_remote.destroy_mutex) {
+			ctx->active_remote.running = true;
+		} else {
+			// No search thread: do not leave a half-initialised remote that would
+			// block cleanup_rtsp forever on destroy_mutex or vTaskDelete(NULL).
+			LOG_ERROR("[%p]: cannot start search_remote thread", ctx);
+			if (ctx->active_remote.destroy_mutex) {
+				vSemaphoreDelete(ctx->active_remote.destroy_mutex);
+			}
+			ctx->active_remote.destroy_mutex = NULL;
+			ctx->active_remote.thread = NULL;
+		}
 
 	} else if (!strcmp(method, "SETUP") && ((buf = kd_lookup(headers, "Transport")) != NULL)) {
 		char *p;
@@ -628,10 +645,16 @@ void cleanup_rtsp(raop_ctx_t *ctx, bool abort) {
 		// destroy_mutex handshake lets it finish its current critical section;
 		// the stack/taskbuf are static so there is nothing to free here.
 		ctx->active_remote.running = false;
-		xSemaphoreTake(ctx->active_remote.destroy_mutex, portMAX_DELAY);
-		vTaskDelete(ctx->active_remote.thread);
+		if (ctx->active_remote.destroy_mutex) {
+			xSemaphoreTake(ctx->active_remote.destroy_mutex, portMAX_DELAY);
+		}
+		if (ctx->active_remote.thread) {
+			vTaskDelete(ctx->active_remote.thread);
+		}
 		// active_remote.xTaskBuffer is static internal RAM; do not free it.
-		vSemaphoreDelete(ctx->active_remote.destroy_mutex);
+		if (ctx->active_remote.destroy_mutex) {
+			vSemaphoreDelete(ctx->active_remote.destroy_mutex);
+		}
 		memset(&ctx->active_remote, 0, sizeof(ctx->active_remote));
 		ctx->active_remote.xStack = s_search_stack;
 		ctx->active_remote.xTaskBuffer = &s_search_taskbuf;

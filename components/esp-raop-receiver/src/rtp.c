@@ -76,8 +76,10 @@ extern log_level 	raop_loglevel;
 #define MIN_LATENCY		11025
 #define MAX_LATENCY   	( (120 * RAOP_SAMPLE_RATE * 2) / 100 )
 
-// Stacks are sized in BYTES (xTaskCreate* takes bytes), and the static stack
-// arrays are sized from these values, so the two can never drift apart.
+// Stack sizes are expressed in BYTES for readability, but xTaskCreateStatic*
+// takes a count of StackType_t ELEMENTS (it does NOT multiply by sizeof the way
+// the dynamic xTaskCreate* does). Always pass the *_WORDS values to the static
+// create calls; passing bytes would overshoot the array by sizeof(StackType_t).
 #define RTP_STACK_SIZE	(4*1024)
 #define RTP_STACK_WORDS	(RTP_STACK_SIZE / sizeof(StackType_t))
 
@@ -85,6 +87,9 @@ extern log_level 	raop_loglevel;
 // path, which itself calls into the audio tap/volume callbacks.
 #define DECODE_STACK_SIZE	(8*1024)
 #define DECODE_STACK_WORDS	(DECODE_STACK_SIZE / sizeof(StackType_t))
+// The static create call must receive the element count, not the byte count.
+_Static_assert(RTP_STACK_WORDS * sizeof(StackType_t) == RTP_STACK_SIZE, "RTP stack size mismatch");
+_Static_assert(DECODE_STACK_WORDS * sizeof(StackType_t) == DECODE_STACK_SIZE, "decode stack size mismatch");
 
 // RX must outrank decode so socket draining is never blocked by ALAC work,
 // and so the producer always wins the SPSC ring against the consumer. It stays
@@ -370,35 +375,51 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	resp.tport = ctx->rtp_sockets[TIMING].lport;
 	resp.aport = ctx->rtp_sockets[DATA].lport;
 
-	ctx->running = true;
+	// Decode thread plumbing first (semaphore before task, so the task can never
+	// run with a NULL semaphore), then the RX thread. running is only set true if
+	// both actually started -- otherwise rtp_end's join would wait forever.
+	ctx->decode_taskbuf = &s_decode_taskbuf;
+	ctx->decode_stack = s_decode_stack;
+	ctx->decode_done = xSemaphoreCreateBinary();
+	if (!ctx->decode_done) {
+		LOG_ERROR("[%p]: cannot create decode-done semaphore", ctx);
+		rc = false;
+	}
 
 #ifdef WIN32
-	pthread_create(&ctx->thread, NULL, rtp_thread_func, (void *) ctx);
+	if (rc) {
+		ctx->running = true;
+		pthread_create(&ctx->thread, NULL, rtp_thread_func, (void *) ctx);
+	}
 #else
-	ctx->xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-	BaseType_t core_id = (CONFIG_PTHREAD_TASK_CORE_DEFAULT == -1) ? tskNO_AFFINITY : CONFIG_PTHREAD_TASK_CORE_DEFAULT;
-	ctx->thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) rtp_thread_func, "RTP_thread", RTP_STACK_SIZE, ctx,
-																							RTP_RX_PRIORITY, ctx->xStack, ctx->xTaskBuffer,
-																							core_id);
+	if (rc) {
+		ctx->xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		BaseType_t core_id = (CONFIG_PTHREAD_TASK_CORE_DEFAULT == -1) ? tskNO_AFFINITY : CONFIG_PTHREAD_TASK_CORE_DEFAULT;
+		ctx->thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) rtp_thread_func, "RTP_thread", RTP_STACK_WORDS, ctx,
+																								RTP_RX_PRIORITY, ctx->xStack, ctx->xTaskBuffer,
+																								core_id);
+		if (!ctx->thread) {
+			LOG_ERROR("[%p]: cannot start RTP thread", ctx);
+			rc = false;
+		}
+	}
 
 	// Decode thread: ALAC decode + playtime forwarding, off the RX thread.
 	// Unpinned: hard-pinning it to core 0 is what starved the mDNS responder,
 	// and there is no benefit to confining it when the scheduler can balance.
-	ctx->decode_taskbuf = &s_decode_taskbuf;
-	ctx->decode_stack = s_decode_stack;
-	// Create the binary semaphore BEFORE the task: the task may run immediately on
-	// creation and try to give it on exit, so it must already exist.
-	ctx->decode_done = xSemaphoreCreateBinary();
-	if (!ctx->decode_done) {
-		LOG_ERROR("[%p]: cannot create decode-done semaphore", ctx);
-		ctx->decode_thread = NULL;
-	} else {
-		ctx->decode_thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) decode_thread_func, "ALAC_decode", DECODE_STACK_SIZE, ctx,
+	if (rc) {
+		ctx->decode_thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) decode_thread_func, "ALAC_decode", DECODE_STACK_WORDS, ctx,
 																							RTP_DECODE_PRIORITY, ctx->decode_stack, ctx->decode_taskbuf,
 																							tskNO_AFFINITY);
 		if (!ctx->decode_thread) {
 			LOG_ERROR("[%p]: cannot start decode thread", ctx);
+			rc = false;
 		}
+	}
+
+	// Only let the threads observe "running" once both exist.
+	if (rc) {
+		__atomic_store_n(&ctx->running, true, __ATOMIC_RELEASE);
 	}
 #endif
 
@@ -420,16 +441,22 @@ void rtp_end(rtp_t *ctx)
 
 	if (!ctx) return;
 
-	if (ctx->running) {
+	// Tear down whichever threads actually exist, even after a partial init
+	// (e.g. RX started but decode failed): guards are on handle != NULL, not on
+	// running, so a half-initialised context cannot leak a live task.
+	if (ctx->thread || ctx->decode_thread) {
 #if !defined WIN32
 		ctx->joiner = xTaskGetCurrentTaskHandle();
 #endif
 		__atomic_store_n(&ctx->running, false, __ATOMIC_RELEASE);
 #ifdef WIN32
-		pthread_join(ctx->thread, NULL);
+		if (ctx->thread) pthread_join(ctx->thread, NULL);
 #else
-		ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
-		vTaskDelete(ctx->thread);
+		if (ctx->thread) {
+			ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+			vTaskDelete(ctx->thread);
+			ctx->thread = NULL;
+		}
 		SAFE_PTR_FREE(ctx->xTaskBuffer);
 		// Join the decode thread before freeing ctx/rawq: it dereferences both, and
 		// vTaskDelete() on another task is not a join. Wait on the binary semaphore
@@ -869,13 +896,18 @@ static void rtp_thread_func(void *arg) {
 			if (rtp_last_log == 0 || now - rtp_last_log >= 5000) {
 				rtp_last_log = now;
 				UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
-				// resent_*/silent/discarded are updated by the decode thread under
-				// ab_mutex; snapshot them under the same lock for a consistent read.
-				pthread_mutex_lock(&ctx->ab_mutex);
-				u32_t resent_req = ctx->resent_req, resent_rec = ctx->resent_rec;
-				u32_t silent = ctx->silent_frames, discarded = ctx->discarded;
-				seq_t ab_write = ctx->ab_write, ab_read = ctx->ab_read;
-				pthread_mutex_unlock(&ctx->ab_mutex);
+				// Diagnostics updated by the decode thread. Read them RELAXED rather
+				// than taking ab_mutex here: this is the RX thread, and blocking it on
+				// the decode thread's per-packet lock is exactly the drain stall the
+				// decode split exists to avoid. Each field is <= 32-bit and word
+				// aligned, so RELAXED reads are individually torn-free; a slightly
+				// inconsistent mix across fields is harmless for a log line.
+				u32_t resent_req = __atomic_load_n(&ctx->resent_req, __ATOMIC_RELAXED);
+				u32_t resent_rec = __atomic_load_n(&ctx->resent_rec, __ATOMIC_RELAXED);
+				u32_t silent = __atomic_load_n(&ctx->silent_frames, __ATOMIC_RELAXED);
+				u32_t discarded = __atomic_load_n(&ctx->discarded, __ATOMIC_RELAXED);
+				seq_t ab_write = __atomic_load_n(&ctx->ab_write, __ATOMIC_RELAXED);
+				seq_t ab_read = __atomic_load_n(&ctx->ab_read, __ATOMIC_RELAXED);
 				LOG_INFO("[%p]: rtp health [W:%hu R:%hu] resent_req=%u resent_rec=%u "
 				         "silent=%u discarded=%u rawq_ovf=%u stack_hwm=%uB",
 				         ctx, ab_write, ab_read, resent_req,
