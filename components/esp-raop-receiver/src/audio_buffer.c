@@ -288,6 +288,16 @@ void audio_buffer_start(void) {
         return;
     }
 
+    // A live task handle with running==false means a prior stop() leaked a wedged
+    // task (it returned without clearing the handle). Refuse to start a second one:
+    // overwriting audio_buf.task would lose the only reference to the wedged task,
+    // which still holds ab_mutex, and deinit could then free a mutex it is using.
+    if (audio_buf.task) {
+        ESP_LOGE(TAG, "Cannot start: a previous output task is still live "
+                      "(reboot recommended)");
+        return;
+    }
+
     // Create the exit-handshake semaphore *before* the task so the task can never
     // give a NULL handle, mirroring the RTP rx_done/decode_done pattern.
     if (!audio_buf.done) {
