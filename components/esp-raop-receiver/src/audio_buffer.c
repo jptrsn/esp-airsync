@@ -27,6 +27,7 @@ static struct {
     uint32_t read_idx;
     uint32_t write_idx;
     SemaphoreHandle_t mutex;
+    SemaphoreHandle_t done;   // given by the output task just before it self-deletes
     TaskHandle_t task;
     bool running;
     uint32_t start_time;
@@ -227,7 +228,12 @@ static void audio_output_task(void *arg) {
     }
 
     ESP_LOGD(TAG, "Audio output task exiting");
-    vTaskSuspend(NULL);
+    // Signal the bounded stop handshake, then delete ourselves. We are the only
+    // writer of what we touch after this point, so self-delete is safe and lets
+    // audio_buffer_stop() join deterministically instead of sleeping and
+    // hoping the loop noticed running==false.
+    xSemaphoreGive(audio_buf.done);
+    vTaskDelete(NULL);
 }
 
 void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
@@ -282,12 +288,27 @@ void audio_buffer_start(void) {
         return;
     }
 
+    // Create the exit-handshake semaphore *before* the task so the task can never
+    // give a NULL handle, mirroring the RTP rx_done/decode_done pattern.
+    if (!audio_buf.done) {
+        audio_buf.done = xSemaphoreCreateBinary();
+        if (!audio_buf.done) {
+            ESP_LOGE(TAG, "Failed to create output-done semaphore");
+            return;
+        }
+    }
+
+    // Drain any stale token left by a prior stop that had to force-delete the task
+    // (the task may have given done just before being deleted), so the next stop
+    // cannot be satisfied by a token from the previous session.
+    xSemaphoreTake(audio_buf.done, 0);
+
     audio_buf.running = true;
     audio_buf.read_idx = 0;
     audio_buf.write_idx = 0;
     audio_buf.start_time = 0;
 
-    xTaskCreatePinnedToCore(
+    BaseType_t ok = xTaskCreatePinnedToCore(
         audio_output_task,
         "audio_output",
         4096,
@@ -296,6 +317,14 @@ void audio_buffer_start(void) {
         &audio_buf.task,
         1
     );
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create audio output task");
+        audio_buf.running = false;
+        audio_buf.task = NULL;
+        vSemaphoreDelete(audio_buf.done);
+        audio_buf.done = NULL;
+        return;
+    }
 
     ESP_LOGI(TAG, "Audio playback started");
 }
@@ -318,9 +347,14 @@ void audio_buffer_stop(void) {
 
     audio_buf.running = false;
 
-    if (audio_buf.task) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        vTaskDelete(audio_buf.task);
+    if (audio_buf.task && audio_buf.done) {
+        // The task breaks its loop, gives done, then deletes itself. Wait for that
+        // signal so teardown is a real join: we must not touch task handles or the
+        // ring after this returns (mirrors the RTP rx_done/decode_done teardown).
+        if (xSemaphoreTake(audio_buf.done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            ESP_LOGW(TAG, "Audio output task did not exit in time; deleting anyway");
+            vTaskDelete(audio_buf.task);
+        }
         audio_buf.task = NULL;
     }
 
@@ -406,6 +440,11 @@ void audio_buffer_deinit(void) {
     // Stop playback if running
     if (audio_buf.running) {
         audio_buffer_stop();
+    }
+
+    if (audio_buf.done) {
+        vSemaphoreDelete(audio_buf.done);
+        audio_buf.done = NULL;
     }
 
     if (audio_buf.mutex) {
