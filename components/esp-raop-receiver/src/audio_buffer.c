@@ -27,8 +27,9 @@ static struct {
     uint32_t read_idx;
     uint32_t write_idx;
     SemaphoreHandle_t mutex;
+    SemaphoreHandle_t done;   // given by the output task just before it self-deletes
     TaskHandle_t task;
-    bool running;
+    bool running;   // accessed cross-core; use atomics, never read/write directly
     uint32_t start_time;
     audio_output_callback_t output_cb;
     void *user_ctx;
@@ -78,7 +79,7 @@ static bool     in_underrun = false;   // edge latch: are we currently starved?
 static void audio_output_task(void *arg) {
     ESP_LOGD(TAG, "Audio output task started");
 
-    while (audio_buf.running) {
+    while (__atomic_load_n(&audio_buf.running, __ATOMIC_ACQUIRE)) {
         // Wait until we have a start time
         if (audio_buf.start_time == 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -227,7 +228,12 @@ static void audio_output_task(void *arg) {
     }
 
     ESP_LOGD(TAG, "Audio output task exiting");
-    vTaskSuspend(NULL);
+    // Signal the bounded stop handshake, then delete ourselves. We are the only
+    // writer of what we touch after this point, so self-delete is safe and lets
+    // audio_buffer_stop() join deterministically instead of sleeping and
+    // hoping the loop noticed running==false.
+    if (audio_buf.done) xSemaphoreGive(audio_buf.done);
+    vTaskDelete(NULL);
 }
 
 void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
@@ -277,17 +283,43 @@ void audio_buffer_start(void) {
         return;
     }
 
-    if (audio_buf.running) {
+    if (__atomic_load_n(&audio_buf.running, __ATOMIC_ACQUIRE)) {
         ESP_LOGW(TAG, "Audio buffer already running");
         return;
     }
 
-    audio_buf.running = true;
+    // A live task handle with running==false means a prior stop() leaked a wedged
+    // task (it returned without clearing the handle). Refuse to start a second one:
+    // overwriting audio_buf.task would lose the only reference to the wedged task,
+    // which still holds ab_mutex, and deinit could then free a mutex it is using.
+    if (audio_buf.task) {
+        ESP_LOGE(TAG, "Cannot start: a previous output task is still live "
+                      "(reboot recommended)");
+        return;
+    }
+
+    // Create the exit-handshake semaphore *before* the task so the task can never
+    // give a NULL handle, mirroring the RTP rx_done/decode_done pattern.
+    if (!audio_buf.done) {
+        audio_buf.done = xSemaphoreCreateBinary();
+        if (!audio_buf.done) {
+            ESP_LOGE(TAG, "Failed to create output-done semaphore");
+            return;
+        }
+    }
+
+    // Defensive drain: on the normal path stop() consumes the token before
+    // clearing task, and the leak path leaves task set so we return just above.
+    // Clearing any stray token here costs nothing and guarantees the next stop()
+    // cannot be satisfied by a token from a previous session.
+    xSemaphoreTake(audio_buf.done, 0);
+
+    __atomic_store_n(&audio_buf.running, true, __ATOMIC_RELEASE);
     audio_buf.read_idx = 0;
     audio_buf.write_idx = 0;
     audio_buf.start_time = 0;
 
-    xTaskCreatePinnedToCore(
+    BaseType_t ok = xTaskCreatePinnedToCore(
         audio_output_task,
         "audio_output",
         4096,
@@ -296,12 +328,20 @@ void audio_buffer_start(void) {
         &audio_buf.task,
         1
     );
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create audio output task");
+        __atomic_store_n(&audio_buf.running, false, __ATOMIC_RELEASE);
+        audio_buf.task = NULL;
+        vSemaphoreDelete(audio_buf.done);
+        audio_buf.done = NULL;
+        return;
+    }
 
     ESP_LOGI(TAG, "Audio playback started");
 }
 
 void audio_buffer_set_start_time(uint32_t playtime) {
-    if (!audio_buf.running) {
+    if (!__atomic_load_n(&audio_buf.running, __ATOMIC_ACQUIRE)) {
         ESP_LOGW(TAG, "Cannot set start time: buffer not running");
         return;
     }
@@ -311,16 +351,29 @@ void audio_buffer_set_start_time(uint32_t playtime) {
 }
 
 void audio_buffer_stop(void) {
-    if (!audio_buf.running) {
+    if (!__atomic_load_n(&audio_buf.running, __ATOMIC_ACQUIRE)) {
         ESP_LOGD(TAG, "Audio buffer already stopped");
         return;
     }
 
-    audio_buf.running = false;
+    __atomic_store_n(&audio_buf.running, false, __ATOMIC_RELEASE);
 
     if (audio_buf.task) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        vTaskDelete(audio_buf.task);
+        // The task breaks its loop, gives done, then deletes itself. Wait for that
+        // signal so teardown is a real join. If it does not exit in time it is
+        // wedged (e.g. holding ab_mutex); we must then NOT force-delete it and
+        // free the state it still touches -- deleting a task does not release the
+        // mutex it holds, which would deadlock the next session's
+        // audio_buffer_write. Leak and report instead (mirrors rtp_end()).
+        if (!audio_buf.done) {
+            ESP_LOGE(TAG, "Output task alive but done semaphore missing; cannot join");
+            return;
+        }
+        if (xSemaphoreTake(audio_buf.done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            ESP_LOGE(TAG, "Audio output task wedged in teardown; leaking session "
+                          "(reboot recommended)");
+            return;
+        }
         audio_buf.task = NULL;
     }
 
@@ -394,7 +447,11 @@ void audio_buffer_flush(void) {
     timing_correction.skip_frames = 0;
     timing_correction.pause_frames = 0;
 
-    // Reset per-track diagnostics so each track starts clean.
+    // Reset per-track diagnostics so each track starts clean. This runs on the
+    // RTSP thread while the output task may still increment these counters; on
+    // Xtensa the 32-bit writes are independent, so this is at worst a lost or
+    // spurious diagnostic count for one instant, never corruption. in_underrun is
+    // the one field with cross-thread semantics, so it is reset atomically.
     memset(&ab_stats, 0, sizeof(ab_stats));
     last_underrun_ms = 0;
     __atomic_store_n(&in_underrun, false, __ATOMIC_RELAXED);
@@ -404,8 +461,22 @@ void audio_buffer_flush(void) {
 
 void audio_buffer_deinit(void) {
     // Stop playback if running
-    if (audio_buf.running) {
+    if (__atomic_load_n(&audio_buf.running, __ATOMIC_ACQUIRE)) {
         audio_buffer_stop();
+    }
+
+    // If stop() left a live task behind (wedged; it leaked and returned without
+    // clearing the handle), do NOT free anything it may still touch -- that would
+    // delete a mutex the task still holds. Leak the whole buffer instead.
+    if (audio_buf.task) {
+        ESP_LOGE(TAG, "Audio output task still live in deinit; leaking buffer "
+                      "(reboot recommended)");
+        return;
+    }
+
+    if (audio_buf.done) {
+        vSemaphoreDelete(audio_buf.done);
+        audio_buf.done = NULL;
     }
 
     if (audio_buf.mutex) {
@@ -460,5 +531,5 @@ void audio_buffer_pause_frames(uint32_t count) {
 }
 
 bool audio_buffer_is_ready(void) {
-    return audio_buf.frames != NULL && audio_buf.running;
+    return audio_buf.frames != NULL && __atomic_load_n(&audio_buf.running, __ATOMIC_ACQUIRE);
 }
