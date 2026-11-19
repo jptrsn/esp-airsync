@@ -28,6 +28,10 @@
 // xTaskCreateStatic* takes an element count of StackType_t, not bytes.
 #define RTSP_STACK_WORDS	(RTSP_STACK_SIZE / sizeof(StackType_t))
 #define SEARCH_STACK_WORDS	(SEARCH_STACK_SIZE / sizeof(StackType_t))
+// These element counts are handed to xTaskCreateStatic* verbatim; assert they
+// still correspond to the intended byte sizes so the units cannot drift.
+_Static_assert(RTSP_STACK_WORDS * sizeof(StackType_t) == RTSP_STACK_SIZE, "RTSP stack size mismatch");
+_Static_assert(SEARCH_STACK_WORDS * sizeof(StackType_t) == SEARCH_STACK_SIZE, "search stack size mismatch");
 
 // Task stacks live in static internal RAM rather than inline in raop_ctx_s.
 // raop_create may fall back to allocating the context from PSRAM when internal
@@ -181,6 +185,15 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
                                              RTSP_STACK_WORDS, ctx,
                                              ESP_TASK_PRIO_MIN + 2, ctx->xStack, ctx->xTaskBuffer,
                                              core_id);
+	if (!ctx->thread) {
+		// Fail the whole create rather than hand back a context with no RTSP
+		// thread: raop_init would report success and the receiver would be deaf.
+		LOG_ERROR("[%p]: cannot start RTSP thread", ctx);
+		if (mdns_mode == RAOP_MDNS_MANAGED) mdns_service_remove("_raop", "_tcp");
+		closesocket(ctx->sock);
+		free(ctx);
+		return NULL;
+	}
 
 	return ctx;
 }
@@ -478,16 +491,28 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		if ((buf = kd_lookup(headers, "DACP-ID")) != NULL) strcpy(ctx->active_remote.DACPid, buf);
 		if ((buf = kd_lookup(headers, "Active-Remote")) != NULL) strcpy(ctx->active_remote.id, buf);
 
+		// Create the mutex first: the thread gives it on exit, so it must exist
+		// before the thread can run. If the mutex cannot be created, do not start
+		// the thread at all (it would xSemaphoreGive(NULL)).
 		ctx->active_remote.destroy_mutex = xSemaphoreCreateBinary();
-		ctx->active_remote.thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) search_remote, "search_remote", SEARCH_STACK_WORDS, ctx,
-                                                            ESP_TASK_PRIO_MIN + 2, ctx->active_remote.xStack, ctx->active_remote.xTaskBuffer,
-                                                            tskNO_AFFINITY );
+		if (ctx->active_remote.destroy_mutex) {
+			ctx->active_remote.thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) search_remote, "search_remote", SEARCH_STACK_WORDS, ctx,
+	                                                            ESP_TASK_PRIO_MIN + 2, ctx->active_remote.xStack, ctx->active_remote.xTaskBuffer,
+	                                                            tskNO_AFFINITY );
+		} else {
+			ctx->active_remote.thread = NULL;
+		}
+
 		if (ctx->active_remote.thread && ctx->active_remote.destroy_mutex) {
 			ctx->active_remote.running = true;
 		} else {
 			// No search thread: do not leave a half-initialised remote that would
-			// block cleanup_rtsp forever on destroy_mutex or vTaskDelete(NULL).
+			// block cleanup_rtsp forever on destroy_mutex or vTaskDelete(NULL). If a
+			// thread did start but the bookkeeping is incomplete, delete it too.
 			LOG_ERROR("[%p]: cannot start search_remote thread", ctx);
+			if (ctx->active_remote.thread) {
+				vTaskDelete(ctx->active_remote.thread);
+			}
 			if (ctx->active_remote.destroy_mutex) {
 				vSemaphoreDelete(ctx->active_remote.destroy_mutex);
 			}

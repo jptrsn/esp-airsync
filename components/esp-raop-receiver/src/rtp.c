@@ -155,7 +155,11 @@ typedef struct rtp_s {
 #ifdef WIN32
 	pthread_t thread;
 #else
-	TaskHandle_t thread, joiner;
+	TaskHandle_t thread;
+	// RX-exit handshake, same rationale as decode_done: a binary semaphore the
+	// RX task gives just before suspending, so teardown never relies on a
+	// task-notification count or a joiner handle that may not be set yet.
+	SemaphoreHandle_t rx_done;
 	StaticTask_t *xTaskBuffer;
     StackType_t xStack[RTP_STACK_WORDS] __attribute__ ((aligned (4)));
 #endif
@@ -375,24 +379,34 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	resp.tport = ctx->rtp_sockets[TIMING].lport;
 	resp.aport = ctx->rtp_sockets[DATA].lport;
 
-	// Decode thread plumbing first (semaphore before task, so the task can never
-	// run with a NULL semaphore), then the RX thread. running is only set true if
-	// both actually started -- otherwise rtp_end's join would wait forever.
+	// Both exit semaphores and (below) running are established before either task
+	// can run: a thread must never observe running==false on entry, nor run with
+	// a NULL exit semaphore. On any create failure rc is cleared and rtp_end
+	// tears down whichever threads did start (guarding on handles, not running).
 	ctx->decode_taskbuf = &s_decode_taskbuf;
 	ctx->decode_stack = s_decode_stack;
 	ctx->decode_done = xSemaphoreCreateBinary();
-	if (!ctx->decode_done) {
-		LOG_ERROR("[%p]: cannot create decode-done semaphore", ctx);
+	ctx->rx_done = xSemaphoreCreateBinary();
+	if (!ctx->decode_done || !ctx->rx_done) {
+		LOG_ERROR("[%p]: cannot create exit semaphores", ctx);
 		rc = false;
 	}
 
 #ifdef WIN32
 	if (rc) {
-		ctx->running = true;
+		// running MUST be set before the thread starts: the RX loop tests it
+		// first thing, and a thread that observes false exits immediately and
+		// (without this ordering) could signal teardown before it is armed.
+		__atomic_store_n(&ctx->running, true, __ATOMIC_RELEASE);
 		pthread_create(&ctx->thread, NULL, rtp_thread_func, (void *) ctx);
 	}
 #else
+	// running is published BEFORE the threads start. The RX loop reads it on its
+	// first iteration; if it were false at that instant the thread would exit and
+	// the session would come up deaf. Publishing first also means the threads can
+	// never run with a NULL exit semaphore.
 	if (rc) {
+		__atomic_store_n(&ctx->running, true, __ATOMIC_RELEASE);
 		ctx->xTaskBuffer = (StaticTask_t*) heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 		BaseType_t core_id = (CONFIG_PTHREAD_TASK_CORE_DEFAULT == -1) ? tskNO_AFFINITY : CONFIG_PTHREAD_TASK_CORE_DEFAULT;
 		ctx->thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) rtp_thread_func, "RTP_thread", RTP_STACK_WORDS, ctx,
@@ -400,26 +414,26 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 																								core_id);
 		if (!ctx->thread) {
 			LOG_ERROR("[%p]: cannot start RTP thread", ctx);
+			__atomic_store_n(&ctx->running, false, __ATOMIC_RELEASE);
 			rc = false;
 		}
 	}
 
 	// Decode thread: ALAC decode + playtime forwarding, off the RX thread.
-	// Unpinned: hard-pinning it to core 0 is what starved the mDNS responder,
-	// and there is no benefit to confining it when the scheduler can balance.
+	// Pinned to core 0: the I2S/output consumer runs on core 1, and pinning
+	// decode away from it means a decode burst can never preempt the task that
+	// feeds I2S (decode at prio 4 would otherwise outrank output at prio 3 when
+	// placed on CPU1). mDNS stays on CPU1 at prio 5, above both, so discovery is
+	// unaffected. Decode blocks on a notification when idle, so it does not
+	// compete for CPU0 with the WiFi/lwIP work there except when busy.
 	if (rc) {
 		ctx->decode_thread = xTaskCreateStaticPinnedToCore( (TaskFunction_t) decode_thread_func, "ALAC_decode", DECODE_STACK_WORDS, ctx,
 																							RTP_DECODE_PRIORITY, ctx->decode_stack, ctx->decode_taskbuf,
-																							tskNO_AFFINITY);
+																							0);
 		if (!ctx->decode_thread) {
 			LOG_ERROR("[%p]: cannot start decode thread", ctx);
 			rc = false;
 		}
-	}
-
-	// Only let the threads observe "running" once both exist.
-	if (rc) {
-		__atomic_store_n(&ctx->running, true, __ATOMIC_RELEASE);
 	}
 #endif
 
@@ -445,17 +459,24 @@ void rtp_end(rtp_t *ctx)
 	// (e.g. RX started but decode failed): guards are on handle != NULL, not on
 	// running, so a half-initialised context cannot leak a live task.
 	if (ctx->thread || ctx->decode_thread) {
-#if !defined WIN32
-		ctx->joiner = xTaskGetCurrentTaskHandle();
-#endif
 		__atomic_store_n(&ctx->running, false, __ATOMIC_RELEASE);
 #ifdef WIN32
 		if (ctx->thread) pthread_join(ctx->thread, NULL);
 #else
 		if (ctx->thread) {
-			ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
+			// Wait for the RX thread's exit semaphore (given just before it
+			// suspends). Bounded: a wedged RX thread must not hang teardown.
+			if (xSemaphoreTake(ctx->rx_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+				LOG_ERROR("[%p]: RTP thread wedged in teardown; leaking session context "
+				          "(reboot recommended)", ctx);
+				return;
+			}
 			vTaskDelete(ctx->thread);
 			ctx->thread = NULL;
+		}
+		if (ctx->rx_done) {
+			vSemaphoreDelete(ctx->rx_done);
+			ctx->rx_done = NULL;
 		}
 		SAFE_PTR_FREE(ctx->xTaskBuffer);
 		// Join the decode thread before freeing ctx/rawq: it dereferences both, and
@@ -530,8 +551,13 @@ void rtp_flush_release(rtp_t *ctx) {
 
 /*---------------------------------------------------------------------------*/
 void rtp_record(rtp_t *ctx, unsigned short seqno, unsigned rtptime) {
+    // state and first_seqno are read/mutated by the decode thread under
+    // ab_mutex; take the same lock here so this RTSP-thread write cannot race
+    // the decode-side state machine.
+    pthread_mutex_lock(&ctx->ab_mutex);
     __atomic_store_n(&ctx->first_seqno, (seqno || rtptime) ? seqno : -1, __ATOMIC_RELEASE);
 	ctx->state = RTP_WAIT;
+    pthread_mutex_unlock(&ctx->ab_mutex);
 	LOG_DEBUG("[%p]: record %hu - %u", ctx, seqno, rtptime);
 }
 
@@ -1073,7 +1099,7 @@ static void rtp_thread_func(void *arg) {
 	LOG_INFO("[%p]: terminating", ctx);
 
 #ifndef WIN32
-	xTaskNotifyGive(ctx->joiner);
+	if (ctx->rx_done) xSemaphoreGive(ctx->rx_done);
 	vTaskSuspend(NULL);
 #else
 	return NULL;
