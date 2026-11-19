@@ -192,7 +192,14 @@ raop_handle_t *s_handle = NULL;
 
 static void internal_data_cb(const uint8_t *data, size_t len, uint32_t playtime) {
     if (!audio_buffer_write(data, len, playtime)) {
-        ESP_LOGW(TAG, "Failed to buffer audio frame");
+        // A full ring drops the incoming frame, which can happen at packet rate
+        // during a burst; throttle so this does not flood the console.
+        static uint32_t last_warn_ms = 0;
+        uint32_t now = gettime_ms();
+        if (last_warn_ms == 0 || now - last_warn_ms >= 1000) {
+            last_warn_ms = now;
+            ESP_LOGW(TAG, "Failed to buffer audio frame (ring full)");
+        }
     }
 }
 

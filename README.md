@@ -135,6 +135,29 @@ Once configured:
 - **WLED Sync**: FFT computation (Core 0) and UDP sender (Core 1) for audio-reactive lighting
 - **Timing Sync**: NTP-based synchronization for multi-room playback
 
+### Audio pipeline and mDNS tuning
+
+The RTP receive thread never decodes: it copies raw packets into a fixed
+256-slot (~352KB PSRAM) single-producer/single-consumer queue and a separate
+decode task does ALAC work, so socket draining is never blocked by decoding.
+Priorities are set so RTP RX (10) outranks decode (4); decode is pinned to
+core 0 so it cannot preempt the I2S/output consumer on core 1. See
+`components/esp-raop-receiver/src/rtp.c`.
+
+mDNS is the other half of staying connected: if the responder is starved it
+cannot answer the controllers' unicast SRV/A resolves and the device is dropped
+mid-playback. `sdkconfig.defaults.<target>` therefore raises
+`CONFIG_MDNS_TASK_PRIORITY` to 5 (above decode's 4, below RTP RX's 10) and pins
+the responder to core 1. This is defensive: the decode task now blocks on a
+notification instead of busy-polling, which removes the original starvation
+cause, but keeping mDNS above decode guards against future priority changes. If
+you retune task priorities or affinity, keep mDNS schedulable or the "device
+disappears" symptom returns.
+
+Note: task stacks for the RTSP (24KB), decode (8KB), RTP RX (4KB) and search
+(3KB) threads live in internal RAM (~39 KB of `.bss`), not PSRAM, because PSRAM
+stacks are unsafe here. This is a fixed cost, not per-session heap.
+
 ## Credits and Acknowledgments
 
 This project builds upon and incorporates code from:
@@ -167,7 +190,8 @@ This license was chosen to maintain compatibility with the GPL-licensed componen
 
 ### Memory Usage
 - **PSRAM**: ~2.7MB for audio buffers (RTP jitter buffer + ring buffer)
-- **DRAM**: ~180KB for code and data
+- **DRAM**: ~85KB static (`.data` + `.bss`); ~39KB of that is permanent task
+  stacks. The rest of the internal-RAM budget is WiFi/lwIP runtime.
 - **Flash**: ~900KB application binary
 
 ### Network Requirements

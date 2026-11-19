@@ -7,8 +7,6 @@
 
 static const char *TAG = "i2s_output";
 static float current_volume = 1.0f;
-static int16_t *volume_buffer = NULL;
-static size_t volume_buffer_size = 0;
 
 static i2s_chan_handle_t tx_handle = NULL;
 
@@ -92,15 +90,28 @@ void i2s_output_write(const uint8_t *data, size_t len)
         return;
     }
 
-    // Ensure buffer is large enough (allocate once, reuse)
-    if (volume_buffer_size < len) {
-        if (volume_buffer) free(volume_buffer);
-        volume_buffer = malloc(len);
-        if (!volume_buffer) {
-            ESP_LOGE(TAG, "Failed to allocate volume buffer");
-            return;
+    // Pre-allocated volume-scaling scratch, sized to the max audio frame. Never
+    // allocated in the hot path: a mid-stream malloc can fail under memory
+    // pressure and would otherwise spin forever logging errors, starving CPU
+    // and the WiFi stack (which manifests as total packet loss).
+    #define VOLUME_BUF_MAX 2048
+    static int16_t volume_buf[VOLUME_BUF_MAX / sizeof(int16_t)];
+    // audio_buffer caps frames at MAX_FRAME_SIZE == 2048 (see audio_buffer.c), so
+    // for that producer this scratch always fits. i2s_output_write() is a public
+    // entry point with no size contract, though, so a caller that bypasses
+    // audio_buffer can still exceed it -- the pass-through below is a safety
+    // valve for that case, not dead code.
+    if (len > sizeof(volume_buf)) {
+        // Reachable only via a caller that bypasses audio_buffer sizing. Pass
+        // through unscaled rather than drop audio, and warn once so it is noticed.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            ESP_LOGW(TAG, "frame %u > volume scratch, volume not applied", (unsigned)len);
         }
-        volume_buffer_size = len;
+        size_t _w = 0;
+        i2s_channel_write(tx_handle, data, len, &_w, portMAX_DELAY);
+        return;
     }
 
     const uint8_t *output_data;
@@ -117,9 +128,9 @@ void i2s_output_write(const uint8_t *data, size_t len)
             int32_t scaled_sample = (int32_t)(samples[i] * current_volume);
             if (scaled_sample > 32767) scaled_sample = 32767;
             if (scaled_sample < -32768) scaled_sample = -32768;
-            volume_buffer[i] = (int16_t)scaled_sample;
+            volume_buf[i] = (int16_t)scaled_sample;
         }
-        output_data = (uint8_t *)volume_buffer;
+        output_data = (uint8_t *)volume_buf;
     }
 
     // if (call_count++ % 100 == 0) {

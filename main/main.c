@@ -107,9 +107,25 @@ static void start_airplay_receiver(const app_config_t *app_config)
         .pcm_tap_cb      = app_config->wled_enabled ? wled_sync_pcm_tap : NULL,
     };
 
-    esp_err_t err = raop_init(&config, &raop_handle);
+    // A transient failure here is usually internal-RAM fragmentation while the
+    // WiFi/lwIP stacks are still settling. raop_init fully clears its singleton
+    // on failure, so retrying is safe; give it a few short waits rather than
+    // leaving the device without AirPlay until the next reboot.
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        err = raop_init(&config, &raop_handle);
+        if (err == ESP_OK) break;
+        ESP_LOGW(TAG, "AirPlay init attempt %d/5 failed: %s", attempt, esp_err_to_name(err));
+        // Only retry the plausibly-transient failures (memory fragmentation);
+        // a permanent error would just burn 5s and log five identical lines.
+        if (err != ESP_ERR_NO_MEM && err != ESP_ERR_RAOP_NETWORK_FAILED &&
+            err != ESP_ERR_RAOP_MDNS_FAILED) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start AirPlay: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to start AirPlay after retries: %s", esp_err_to_name(err));
         return;
     }
 

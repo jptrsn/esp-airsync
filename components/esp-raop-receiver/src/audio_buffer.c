@@ -52,7 +52,6 @@ static struct {
     uint32_t dropped_full;      // writes rejected because the ring was full
     uint32_t skip_total;        // frames dropped by timing correction
     uint32_t pause_total;       // silence frames inserted by timing correction
-    uint32_t last_log_ms;       // timestamp of last periodic health log
 } ab_stats = {0};
 
 // Hot-path scratch buffers kept off the audio_output_task stack. Three
@@ -67,9 +66,17 @@ static uint32_t gettime_ms(void) {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
+// Underrun log throttle. File scope so audio_buffer_flush() can reset it with
+// the rest of the per-track diagnostics.
+static uint32_t last_underrun_ms = 0;
+// Cross-thread: written by the output task (set on starvation, clear on audio)
+// and by audio_buffer_flush() on the RTSP thread (clear per track). Use atomics
+// so the flush cannot clobber a concurrently-set latch without a lock; the
+// worst case is one spurious/missed count, never corruption.
+static bool     in_underrun = false;   // edge latch: are we currently starved?
+
 static void audio_output_task(void *arg) {
     ESP_LOGD(TAG, "Audio output task started");
-    static uint32_t last_underrun_ms = 0;
 
     while (audio_buf.running) {
         // Wait until we have a start time
@@ -177,24 +184,33 @@ static void audio_output_task(void *arg) {
                 xSemaphoreGive(audio_buf.mutex);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
+            __atomic_store_n(&in_underrun, false, __ATOMIC_RELAXED);
         } else {
             // Ring drained while we are supposed to be playing: a playback
             // underrun (silence until the RTP producer refills it).
             xSemaphoreGive(audio_buf.mutex);
             uint32_t now_ms = gettime_ms();
-            if (now_ms - last_underrun_ms > 100) {
-                last_underrun_ms = now_ms;
+            // Count underruns edge-triggered: one per entry into the empty state,
+            // not one per 10ms retry (which inflates the counter), and log at most
+            // once a second while the gap persists.
+            if (!__atomic_load_n(&in_underrun, __ATOMIC_RELAXED)) {
+                __atomic_store_n(&in_underrun, true, __ATOMIC_RELAXED);
                 ab_stats.underruns++;
+            }
+            if (now_ms - last_underrun_ms > 1000) {
+                last_underrun_ms = now_ms;
                 ESP_LOGW(TAG, "UNDERRUN: ring empty while playing (count=%u)", ab_stats.underruns);
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
 
-        // Periodic health log: ring fill, counters, stack high-water mark.
+        // Periodic health log (diagnostics) - keep rare to avoid UART floods.
         {
+            static uint32_t s_last_health = 0;
             uint32_t now_ms = gettime_ms();
-            if (ab_stats.last_log_ms == 0 || now_ms - ab_stats.last_log_ms >= 5000) {
-                ab_stats.last_log_ms = now_ms;
+            if (s_last_health == 0) s_last_health = now_ms;
+            if (now_ms - s_last_health >= 30000) {
+                s_last_health = now_ms;
                 xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
                 uint32_t fill = (audio_buf.write_idx >= audio_buf.read_idx)
                     ? (audio_buf.write_idx - audio_buf.read_idx)
@@ -322,39 +338,41 @@ bool audio_buffer_write(const uint8_t *data, size_t len, uint32_t playtime) {
         return false;
     }
 
-    // Try up to 5 times with 10ms delays between attempts
-    for (int retries = 0; retries < 5; retries++) {
-        xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
+    // Called from the RTP receive thread. MUST NOT block: if we sleep here, the
+    // RTP socket stops draining and the WiFi RX path backs up, which cascades
+    // into massive packet loss. On a full ring, drop the INCOMING frame instead
+    // of waiting (we're behind realtime anyway).
+    //
+    // Dropping the incoming frame, not the oldest, keeps read_idx owned solely
+    // by the consumer task: advancing it here from the producer would be a
+    // cross-task mutation of the consumer's cursor while it is scheduling the
+    // frame to play.
+    xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
 
-        uint32_t next_write = (audio_buf.write_idx + 1) % BUFFER_FRAMES;
-
-        // Check if buffer has space
-        if (next_write != audio_buf.read_idx) {
-            audio_frame_t *frame = &audio_buf.frames[audio_buf.write_idx];
-            memcpy(frame->data, data, len);
-            frame->len = len;
-            frame->playtime = playtime;
-            frame->ready = true;
-            frame->tapped = false;
-
-            audio_buf.write_idx = next_write;
-            ab_stats.frames_written++;
-
-            xSemaphoreGive(audio_buf.mutex);
-            return true;
-        }
-
+    uint32_t next_write = (audio_buf.write_idx + 1) % BUFFER_FRAMES;
+    if (next_write == audio_buf.read_idx) {
+        // Full: drop the incoming frame. Return false so the caller's
+        // "failed to buffer" telemetry reflects the drop (the frame was not
+        // stored) -- this is a drop, not a success.
+        ab_stats.dropped_full++;
         xSemaphoreGive(audio_buf.mutex);
-
-        // Buffer full, wait for I2S to drain
-        if (retries < 4) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
+        return false;
     }
 
-    ab_stats.dropped_full++;
-    ESP_LOGW(TAG, "Buffer full after retries, dropping frame (dropped_full=%u)", ab_stats.dropped_full);
-    return false;
+    {
+        audio_frame_t *frame = &audio_buf.frames[audio_buf.write_idx];
+        memcpy(frame->data, data, len);
+        frame->len = len;
+        frame->playtime = playtime;
+        frame->ready = true;
+        frame->tapped = false;
+
+        audio_buf.write_idx = next_write;
+        ab_stats.frames_written++;
+    }
+
+    xSemaphoreGive(audio_buf.mutex);
+    return true;
 }
 
 void audio_buffer_flush(void) {
@@ -377,9 +395,9 @@ void audio_buffer_flush(void) {
     timing_correction.pause_frames = 0;
 
     // Reset per-track diagnostics so each track starts clean.
-    uint32_t keep_log_ms = ab_stats.last_log_ms;
     memset(&ab_stats, 0, sizeof(ab_stats));
-    ab_stats.last_log_ms = keep_log_ms;
+    last_underrun_ms = 0;
+    __atomic_store_n(&in_underrun, false, __ATOMIC_RELAXED);
 
     ESP_LOGD(TAG, "Buffer flushed");
 }

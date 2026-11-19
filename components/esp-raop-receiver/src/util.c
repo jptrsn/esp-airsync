@@ -94,6 +94,12 @@ int bind_socket(unsigned short *port, int mode)
 		return sock;
 	}
 
+	// No SO_RCVBUF here on purpose. In lwIP it caps the total buffered *bytes*
+	// for a netconn (recv_avail + p->tot_len > recv_bufsize drops the datagram),
+	// and the default cap is already INT_MAX -- setting it can only ever make
+	// things worse. The real burst limit is the per-socket receive mailbox,
+	// which is packet-count based; it is sized via CONFIG_LWIP_UDP_RECVMBOX_SIZE.
+
 	/*  Populate socket address structure  */
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family      = AF_INET;
@@ -201,6 +207,8 @@ bool http_parse(int sock, char *method, key_data_t *rkd, char **body, int *len)
 		}
 		return false;
 	}
+
+	LOG_SDEBUG("RAWREQ line=[%s] i=%d", line, i);
 
 	if (!sscanf(line, "%s", method)) {
 		LOG_ERROR("missing method", NULL);
@@ -362,7 +370,12 @@ char *http_send(int sock, char *method, key_data_t *rkd)
 {
 	unsigned sent, len;
 	char *resp = kd_dump(rkd);
+	if (!resp) {
+		resp = strdup("\r\n");
+		if (!resp) return NULL;
+	}
 	char *data = malloc(strlen(method) + 2 + strlen(resp) + 2 + 1);
+	if (!data) { NFREE(resp); return NULL; }
 
 	len = sprintf(data, "%s\r\n%s\r\n", method, resp);
 	NFREE(resp);
@@ -434,7 +447,8 @@ char *kd_dump(key_data_t *kd)
 	// First pass: calculate total size needed
 	int total_size = 0;
 	while (kd[i].key) {
-		total_size += strlen(kd[i].key) + strlen(kd[i].data) + 4; // ": \r\n"
+		const char *d = kd[i].data ? kd[i].data : "";
+		total_size += strlen(kd[i].key) + strlen(d) + 4; // ": \r\n"
 		i++;
 	}
 
@@ -445,7 +459,7 @@ char *kd_dump(key_data_t *kd)
 	// Second pass: build string
 	i = 0;
 	while (kd[i].key) {
-		int len = sprintf(str + pos, "%s: %s\r\n", kd[i].key, kd[i].data);
+		int len = sprintf(str + pos, "%s: %s\r\n", kd[i].key, kd[i].data ? kd[i].data : "");
 		pos += len;
 		i++;
 	}
