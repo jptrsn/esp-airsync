@@ -432,6 +432,7 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 																							0);
 		if (!ctx->decode_thread) {
 			LOG_ERROR("[%p]: cannot start decode thread", ctx);
+			__atomic_store_n(&ctx->running, false, __ATOMIC_RELEASE);
 			rc = false;
 		}
 	}
