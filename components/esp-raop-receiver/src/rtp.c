@@ -464,6 +464,10 @@ void rtp_end(rtp_t *ctx)
 #ifdef WIN32
 		if (ctx->thread) pthread_join(ctx->thread, NULL);
 #else
+		// Join both worker tasks BEFORE tearing down any shared resource. An early
+		// return here must leave the context fully intact so the "leak and reboot"
+		// fail-safe does not also leak sockets/codec or free a handle a wedged task
+		// still uses.
 		if (ctx->thread) {
 			// Wait for the RX thread's exit semaphore (given just before it
 			// suspends). Bounded: a wedged RX thread must not hang teardown.
@@ -472,14 +476,7 @@ void rtp_end(rtp_t *ctx)
 				          "(reboot recommended)", ctx);
 				return;
 			}
-			vTaskDelete(ctx->thread);
-			ctx->thread = NULL;
 		}
-		if (ctx->rx_done) {
-			vSemaphoreDelete(ctx->rx_done);
-			ctx->rx_done = NULL;
-		}
-		SAFE_PTR_FREE(ctx->xTaskBuffer);
 		// Join the decode thread before freeing ctx/rawq: it dereferences both, and
 		// vTaskDelete() on another task is not a join. Wait on the binary semaphore
 		// it gives just before deleting itself. If it does not exit in time it is
@@ -493,6 +490,17 @@ void rtp_end(rtp_t *ctx)
 			          "(reboot recommended)", ctx);
 			return;
 		}
+		// Both tasks have exited (or were never created): now it is safe to destroy
+		// the synchronisation primitives and delete the tasks.
+		if (ctx->thread) {
+			vTaskDelete(ctx->thread);
+			ctx->thread = NULL;
+		}
+		if (ctx->rx_done) {
+			vSemaphoreDelete(ctx->rx_done);
+			ctx->rx_done = NULL;
+		}
+		SAFE_PTR_FREE(ctx->xTaskBuffer);
 		ctx->decode_thread = NULL;
 		if (ctx->decode_done) {
 			vSemaphoreDelete(ctx->decode_done);
