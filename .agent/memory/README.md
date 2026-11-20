@@ -19,3 +19,6 @@ Topics
 - [`volume-control-airplay-dBFS-transfer-function.md`](./volume-control-airplay-dBFS-transfer-function.md)
   — AirPlay slider dB was applied raw as dBFS gain; fixed with a port of
   shairport-sync's `vol2attn()` curve, one Q16 gain stage, and a host unit test.
+- [`build-environment-no-esp-idf.md`](./build-environment-no-esp-idf.md)
+  — this container has no ESP-IDF and must not gain one (ephemeral overlay, nested
+  Docker blocked); `idf.py build` for esp32/esp32s3 is a human verification step.

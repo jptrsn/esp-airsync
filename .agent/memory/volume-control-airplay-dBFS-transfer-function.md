@@ -53,13 +53,21 @@ Single source of truth for the volume value, one attenuation stage, documented u
 ## Verification
 - `make -C test && ./test/test_raop_volume` → all checks pass.
 - `gcc -fsyntax-only` against IDF stub headers for `audio_buffer.c`, `raop_core.c`,
-  `i2s_output.c` (no ESP-IDF toolchain in the dev container; `idf.py build` for
-  esp32 + esp32s3 still needs to run on a machine with IDF v5.5.1 — the modified
-  files use no new IDF APIs, only the pre-existing atomics/ESP_LOG idioms).
+  `i2s_output.c` — a syntax gate only, **not** a firmware build.
+- **`idf.py build` for esp32 + esp32s3 has NOT been run.** The OpenHands dev container
+  has no ESP-IDF and should not be asked to install one: the container filesystem is an
+  ephemeral overlay (only `~/.openhands` is a named volume), so a ~2-3 GB toolchain
+  download evaporates on rebuild. Nested Docker is also dead here — no CAP_SYS_ADMIN, so
+  `docker run` fails at `mount … operation not permitted`. Target builds belong on a real
+  IDF v5.5.1 machine; PR #4 carries a comment asking for them, and this stays open until
+  someone runs them. The modified files use no new IDF APIs, only pre-existing
+  atomics/ESP_LOG idioms, so risk is low — but unbuilt means not flashable.
 - Hardware: drag the iOS slider to both ends; expect silence at the bottom and no
   clipping at the top; `raop_core` now logs `Volume: AirPlay %.2f dB -> %.2f dBFS
   (Q16 gain N)` (1/s throttle) and the misleading `i2s_output: Volume set to...`
-  line is gone.
+  line is gone. Note max output is ~half the previous voltage (the −6 dBFS ceiling is
+  deliberate headroom); `RAOP_VOLUME_MAX_DBFS` is the single knob if it's too low for a
+  given amplifier.
 
 ## Key learnings (reusable)
 - **Protocol units are contracts.** A dB figure in a protocol is not automatically a
