@@ -33,3 +33,5 @@ __pycache__/
 *.tmp
 *.bak
 *.orig
+# Host unit test build output
+test/test_raop_volume

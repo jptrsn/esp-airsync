@@ -4,8 +4,8 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "raop_volume.h"
 #include <string.h>
-#include "math.h"
 
 static const char *TAG = "audio_buffer";
 
@@ -36,7 +36,7 @@ static struct {
     // Optional PCM tap — called ~TAP_LOOKAHEAD_MS before playtime
     audio_pcm_tap_cb_t tap_cb;
     void *tap_user_ctx;
-    float *volume_ptr;
+    int32_t *volume_gain_q16;
 } audio_buf = {0};
 
 static struct {
@@ -154,23 +154,15 @@ static void audio_output_task(void *arg) {
                 memcpy(g_play_buf, frame->data, frame->len);
                 size_t len = frame->len;
 
-                // Apply software volume at read time
-                if (audio_buf.volume_ptr) {
-                    float vol_db = *audio_buf.volume_ptr;
-                    if (vol_db <= -144.0f) {
-                        memset(g_play_buf, 0, len);
-                    } else if (vol_db < 0.0f) {
-                        float linear = powf(10.0f, vol_db / 20.0f);
-                        int16_t *samples = (int16_t *)g_play_buf;
-                        size_t count = len / sizeof(int16_t);
-                        for (size_t i = 0; i < count; i++) {
-                            int32_t scaled = (int32_t)(samples[i] * linear);
-                            if (scaled > 32767) scaled = 32767;
-                            if (scaled < -32768) scaled = -32768;
-                            samples[i] = (int16_t)scaled;
-                        }
-                    }
-                    // vol_db == 0.0f: full volume, no scaling needed
+                // Apply software volume at read time. The transfer curve has
+                // already been evaluated (once per volume change) into a Q16
+                // gain, so this is an integer multiply-and-shift — no powf()
+                // per sample. The tap above deliberately sees pre-attenuation
+                // audio, so visualisation amplitude tracks the source, not
+                // the slider.
+                if (audio_buf.volume_gain_q16) {
+                    int32_t gain = __atomic_load_n(audio_buf.volume_gain_q16, __ATOMIC_RELAXED);
+                    raop_volume_scale_s16((int16_t *)g_play_buf, len / sizeof(int16_t), gain);
                 }
 
                 frame->ready = false;
@@ -237,7 +229,7 @@ static void audio_output_task(void *arg) {
 }
 
 void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
-                       audio_pcm_tap_cb_t tap_cb, float *volume_ptr) {
+                       audio_pcm_tap_cb_t tap_cb, int32_t *volume_gain_q16) {
     // If already initialized, just return
     if (audio_buf.frames && audio_buf.mutex) {
         ESP_LOGD(TAG, "Audio buffer already initialized");
@@ -254,7 +246,7 @@ void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
     audio_buf.output_cb = output_cb;
     audio_buf.user_ctx = user_ctx;
     audio_buf.tap_cb = tap_cb;
-    audio_buf.volume_ptr = volume_ptr;
+    audio_buf.volume_gain_q16 = volume_gain_q16;
 
     // Allocate frame buffer in PSRAM
     audio_buf.frames = heap_caps_malloc(BUFFER_FRAMES * sizeof(audio_frame_t),
