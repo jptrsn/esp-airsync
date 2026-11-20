@@ -8,7 +8,9 @@ A high-quality RAOP audio receiver implementation for ESP32 boards with external
 - **AirPlay Audio Streaming**: Full AirPlay 1 protocol support with authentication
 - **Multi-room Sync**: Synchronized playback across multiple AirPlay devices
 - **High-Quality Audio**: PCM5102A DAC support via I²S (44.1kHz, 16-bit stereo)
-- **Software Volume Control**: Smooth volume adjustment
+- **Software Volume Control**: AirPlay slider mapped through an audio-taper
+  curve onto a capped digital range (−6 dBFS ceiling for headroom, −54 dBFS
+  floor for a truly silent minimum); AirPlay mute (−144 dB) is digital silence
 - **ALAC Decoding**: Apple Lossless audio codec support
 - **Robust Buffering**: ~23 seconds of audio buffering with automatic drift correction
 - **WLED Audio-Reactive Sync**: Real-time FFT analysis streamed to WLED devices for audio-reactive lighting effects (optional)
@@ -131,7 +133,8 @@ Once configured:
 - **RTSP Server**: Handles AirPlay control protocol
 - **RTP Receiver**: Manages audio packet reception, ALAC decoding, and jitter buffering
 - **Audio Buffer**: Large PSRAM-based ring buffer with timing-aware playback (Core 1)
-- **I²S Output**: Hardware audio interface with software volume control (Core 1)
+- **I²S Output**: Hardware audio interface (Core 1); PCM is already volume-scaled
+  by the audio buffer — the one and only gain stage in the output path
 - **WLED Sync**: FFT computation (Core 0) and UDP sender (Core 1) for audio-reactive lighting
 - **Timing Sync**: NTP-based synchronization for multi-room playback
 
@@ -224,8 +227,19 @@ esp-airsync/
 ├── components/
 │   ├── esp-raop-receiver/ # Full RAOP library
 │   ├── i2s_output/        # I²S DAC interface
+├── test/                   # Host-buildable unit tests (not part of idf.py build)
 └── partitions.csv         # Flash partition table
 ```
+
+### Running the Host Unit Tests
+```bash
+make -C test && ./test/test_raop_volume
+```
+
+`test/test_raop_volume.c` verifies the AirPlay→dBFS volume transfer function
+(`components/esp-raop-receiver/src/raop_volume.c`): endpoints, monotonicity,
+continuity, the −144 dB mute sentinel, headroom below full scale, and the
+non-linear taper. It builds with a plain host compiler.
 
 ### Building with Debug Symbols
 ```bash

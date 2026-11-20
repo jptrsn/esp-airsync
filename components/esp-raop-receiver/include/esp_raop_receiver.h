@@ -93,7 +93,11 @@ typedef void (*raop_audio_output_cb_t)(
 /**
  * @brief Volume change callback (HARDWARE mode only)
  *
- * @param volume Volume level (0.0 to 1.0)
+ * @param volume Raw AirPlay slider level in dB, exactly as the remote sent it:
+ *               0.0 is loudest, -30.0 quietest, -144.0 is the mute sentinel.
+ *               This is NOT a linear 0.0-1.0 gain and NOT a dBFS figure; a
+ *               hardware consumer must apply its own transfer curve (see
+ *               raop_volume.h for the curve the SOFTWARE path uses).
  * @param user_ctx User context pointer from config
  */
 typedef void (*raop_volume_cb_t)(
@@ -197,6 +201,11 @@ esp_err_t raop_set_device_name(raop_handle_t *handle, const char *name);
 
 /**
  * @brief Get current volume level
+ *
+ * @return Raw AirPlay slider level in dB as last sent by the remote: 0.0
+ *         loudest, -30.0 quietest, -144.0 mute. Not a linear gain, not dBFS.
+ *         The gain actually applied to PCM in SOFTWARE mode is derived from it
+ *         by the transfer curve in raop_volume.h.
  */
 float raop_get_volume(raop_handle_t *handle);
 

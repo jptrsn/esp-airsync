@@ -6,6 +6,7 @@ idf_component_register(
         "src/util.c"
         "src/dmap_parser.c"
         "src/audio_buffer.c"
+        "src/raop_volume.c"
     INCLUDE_DIRS
         "include"
     PRIV_INCLUDE_DIRS

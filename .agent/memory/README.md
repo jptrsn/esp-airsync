@@ -16,3 +16,6 @@ Topics
 - [`raop-alac-decode-stack-overflow.md`](./raop-alac-decode-stack-overflow.md)
   — intermittent mid-track audio glitch; root cause was a 32-bit store into a
   16-bit stack var in the ALAC decode path (fork regression vs squeezelite).
+- [`volume-control-airplay-dBFS-transfer-function.md`](./volume-control-airplay-dBFS-transfer-function.md)
+  — AirPlay slider dB was applied raw as dBFS gain; fixed with a port of
+  shairport-sync's `vol2attn()` curve, one Q16 gain stage, and a host unit test.
