@@ -66,6 +66,33 @@ static void test_endpoints(void)
           "volume +5.0 must not be louder than the slider bottom");
     CHECK_NEAR(raop_volume_to_dbfs(-100.0f), RAOP_VOLUME_MIN_DBFS, 0.01f,
                "volume -100 must clamp to the floor");
+
+    /* NaN (e.g. `volume: nan` from a corrupt SET_PARAMETER) must fail safe
+     * to the floor too: every float comparison is false for NaN, so the
+     * range test must be shaped to catch it. Regression pin for review
+     * round 2. */
+    CHECK(raop_volume_to_dbfs(NAN) == RAOP_VOLUME_MIN_DBFS,
+          "NaN must fail safe to the floor");
+    CHECK(raop_volume_to_gain_q16(NAN) == raop_volume_to_gain_q16(-30.0f),
+          "NaN gain must equal the floor gain, not the ceiling");
+    CHECK(raop_volume_to_gain_q16(NAN) < RAOP_VOLUME_GAIN_UNITY / 2,
+          "NaN gain must be far below unity");
+}
+
+/* ---------- initial state by volume mode ---------- */
+
+static void test_initial_gain(void)
+{
+    /* SOFTWARE: slider top, capped below unity (headroom). */
+    CHECK(raop_volume_initial_gain_q16(1) ==
+              raop_volume_to_gain_q16(RAOP_VOLUME_MAX_AIRPLAY_DB),
+          "SOFTWARE initial gain must be the slider-top gain");
+    CHECK(raop_volume_initial_gain_q16(1) < RAOP_VOLUME_GAIN_UNITY,
+          "SOFTWARE initial gain must sit below unity");
+
+    /* HARDWARE: exact unity — the library must never scale PCM. */
+    CHECK(raop_volume_initial_gain_q16(0) == RAOP_VOLUME_GAIN_UNITY,
+          "HARDWARE initial gain must be exact unity");
 }
 
 /* ---------- mute sentinel ---------- */
@@ -267,6 +294,7 @@ static void test_curve_table(void)
 int main(void)
 {
     test_endpoints();
+    test_initial_gain();
     test_mute();
     test_headroom();
     test_monotonic_continuous();

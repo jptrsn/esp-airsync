@@ -46,11 +46,13 @@
  * @brief Map an AirPlay volume onto the configured dBFS range.
  *
  * @param airplay_db  Raw SET_PARAMETER volume: 0.0 (loudest) to -30.0
- *                    (quietest). Values outside that range fall to
- *                    RAOP_VOLUME_MIN_DBFS (upstream's fail-safe: a malformed
- *                    high value must never map to full volume);
- *                    RAOP_VOLUME_MUTE_DB (-144.0) yields RAOP_VOLUME_MIN_DBFS
- *                    here and a hard zero from raop_volume_to_gain_q16().
+ *                    (quietest). Anything not provably inside that range —
+ *                    out-of-range values, the mute sentinel, or NaN from a
+ *                    corrupt SET_PARAMETER — falls to RAOP_VOLUME_MIN_DBFS
+ *                    (upstream's fail-safe: a malformed value must never
+ *                    map to full volume);
+ *                    RAOP_VOLUME_MUTE_DB (-144.0) yields a hard zero from
+ *                    raop_volume_to_gain_q16().
  * @return Target level in dBFS, within [RAOP_VOLUME_MIN_DBFS, RAOP_VOLUME_MAX_DBFS].
  */
 float raop_volume_to_dbfs(float airplay_db);
@@ -67,6 +69,18 @@ float raop_volume_to_dbfs(float airplay_db);
  *         unity by RAOP_VOLUME_MAX_DBFS.
  */
 int32_t raop_volume_to_gain_q16(float airplay_db);
+
+/**
+ * @brief Initial cached gain for a receiver handle, by volume mode.
+ *
+ * SOFTWARE mode: top of the slider (the dBFS ceiling, capped below unity).
+ * HARDWARE mode: exact unity — the library never scales PCM in that mode,
+ * the consumer owns all gain (see RAOP_VOLUME_HARDWARE in
+ * esp_raop_receiver.h). Pure so the contract is pinned by the host test.
+ *
+ * @param software_mode  non-zero for RAOP_VOLUME_SOFTWARE, zero for HARDWARE
+ */
+int32_t raop_volume_initial_gain_q16(int software_mode);
 
 /**
  * @brief Apply a Q16 gain to 16-bit PCM samples, in place.

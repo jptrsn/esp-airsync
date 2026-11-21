@@ -595,8 +595,12 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		if (body && (p = strcasestr(body, "volume")) != NULL) {
 			float volume;
 
-			sscanf(p, "%*[^:]:%f", &volume);
-			success = ctx->cmd_cb(RAOP_INT_VOLUME, volume);
+			/* Only forward a value we actually parsed: on parse failure
+			 * `volume` is uninitialised stack garbage, and raop_volume's
+			 * fail-safe should be defence in depth, not the first line. */
+			if (sscanf(p, "%*[^:]:%f", &volume) == 1) {
+				success = ctx->cmd_cb(RAOP_INT_VOLUME, volume);
+			}
 		} else if (body && (p = strcasestr(body, "progress")) != NULL) {
 			int start, current, stop = 0;
 

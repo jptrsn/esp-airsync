@@ -248,9 +248,8 @@ esp_err_t raop_init(const raop_config_t *config, raop_handle_t **out_handle) {
     // scale. In HARDWARE mode the library never scales PCM — the consumer
     // owns the gain — so the buffer stays at unity.
     handle->volume = RAOP_VOLUME_MAX_AIRPLAY_DB;
-    handle->volume_gain_q16 = (config->volume_mode == RAOP_VOLUME_SOFTWARE)
-        ? raop_volume_to_gain_q16(handle->volume)
-        : RAOP_VOLUME_GAIN_UNITY;
+    handle->volume_gain_q16 =
+        raop_volume_initial_gain_q16(config->volume_mode == RAOP_VOLUME_SOFTWARE);
 
     // Resolve device name
     uint8_t mac[6];

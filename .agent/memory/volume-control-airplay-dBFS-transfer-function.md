@@ -20,8 +20,10 @@ tags: [audio, volume, raop, airplay, pcm5102a, bugfix]
 ## Root cause
 The AirPlay RAOP `SET_PARAMETER volume` value (contract: `0.0` loudest … `-30.0`
 quietest, `-144.0` mute sentinel) was forwarded **raw** and reinterpreted as a dBFS
-figure in `audio_buffer.c` (one soft-float `powf(10, vol_db/20)` per ~8 ms frame,
-then a per-sample float multiply on a chip with no FPU). The RAOP slider is a
+figure in `audio_buffer.c` (one software-libm `powf(10, vol_db/20)` per ~8 ms
+frame, then a per-sample float multiply — the classic ESP32's LX6 has a
+single-precision FPU but no hardware doubles, and `powf()` is a software
+routine regardless). The RAOP slider is a
 *position*, not a gain. Upstream squeezelite-esp32 normalises on ingest
 (`volume = (volume == -144.0) ? 0 : (1 + volume / 30);`); this fork omitted that,
 and shairport-sync solves the same problem with a purpose-built transfer function
@@ -72,6 +74,12 @@ Single source of truth for the volume value, one attenuation stage, documented u
   overclaims (per-sample `powf`, `(Volume-1)*30` "consistency" on dead code),
   HARDWARE-mode contract documentation, out-of-range fail-safe, mute log line,
   super-unity test comment.
+- **Agentic review (run 2)**: the run-1 fail-safe leaked NaN to full volume
+  (two-sided comparison is always false for NaN). Fix: upstream's *positive*
+  in-range test `!(x <= MAX && x >= MIN) → floor`, plus NaN pins in the host
+  test, `sscanf` return checked in `raop.c`, initial-gain-by-mode extracted to
+  a pure host-tested helper. **Lesson: range-validation guards must be shaped
+  to catch NaN — test the predicate's negation, not two-sided clamping.**
 - Hardware: drag the iOS slider to both ends; expect silence at the bottom and no
   clipping at the top; `raop_core` now logs `Volume: AirPlay %.2f dB -> %.2f dBFS
   (Q16 gain N)` (1/s throttle) and the misleading `i2s_output: Volume set to...`
@@ -91,8 +99,9 @@ Single source of truth for the volume value, one attenuation stage, documented u
   logs its state sends debuggers down the wrong path. One value, one place that
   scales PCM, units in every header.
 - **Keep the hot loop integer.** Transfer curve + `powf` once per volume change into a
-  cached Q16 gain; per-sample work stays multiply-shift + saturate (ESP32-WROVER-B
-  has no usable FPU). The PCM tap deliberately stays pre-attenuation (issue #3 says
+  cached Q16 gain; per-sample work stays multiply-shift + saturate (`powf` is
+  software libm even on the LX6's single-precision FPU). The PCM tap deliberately
+  stays pre-attenuation (issue #3 says
   leaving visualisation amplitude tracking the source, not the slider, is acceptable).
 - **Widen the range, don't just shift it.** −6/−54 dBFS gives 6 dB headroom *and*
   48 dB of range (≥7 bits of resolution at the bottom) from one pair of constants.

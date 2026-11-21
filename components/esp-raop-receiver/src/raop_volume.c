@@ -32,18 +32,17 @@ static float top_segment_slope(long range_db100) {
 
 float raop_volume_to_dbfs(float airplay_db)
 {
-    if (airplay_db <= RAOP_VOLUME_MUTE_DB) {
-        return RAOP_VOLUME_MIN_DBFS;
-    }
-    if (airplay_db > RAOP_VOLUME_MAX_AIRPLAY_DB ||
-        airplay_db < RAOP_VOLUME_MIN_AIRPLAY_DB) {
-        /*
-         * Deliberate (and upstream) fail-safe: vol2attn() sends any
-         * out-of-range value (except the mute sentinel) to the *bottom* of
-         * the range — "for safety" in shairport-sync's words — rather than
-         * clamping a malformed high value (e.g. +20 dB from a corrupt
-         * SET_PARAMETER) up to full volume.
-         */
+    /*
+     * Upstream's structure, deliberately: vol2attn() evaluates the curve
+     * only for values *provably* in range; anything else — the mute
+     * sentinel, an out-of-range figure, or NaN from a corrupt
+     * SET_PARAMETER — goes to the bottom of the range ("for safety" in
+     * shairport-sync's words). The negated in-range test is load-bearing:
+     * every comparison is false for NaN, so an inverted check shape would
+     * let NaN fall through to the ceiling, i.e. full volume.
+     */
+    if (!(airplay_db <= RAOP_VOLUME_MAX_AIRPLAY_DB &&
+          airplay_db >= RAOP_VOLUME_MIN_AIRPLAY_DB)) {
         return RAOP_VOLUME_MIN_DBFS;
     }
 
@@ -97,6 +96,19 @@ int32_t raop_volume_to_gain_q16(float airplay_db)
         return 0;
     }
     return (int32_t)gain;
+}
+
+int32_t raop_volume_initial_gain_q16(int software_mode)
+{
+    /*
+     * Initial state before the remote sends SET_PARAMETER volume:
+     * SOFTWARE sits at the top of the slider (the dBFS ceiling, capped
+     * below unity by RAOP_VOLUME_MAX_DBFS); HARDWARE pins the buffer at
+     * unity because in that mode the consumer owns all gain and the
+     * library must never scale PCM.
+     */
+    return software_mode ? raop_volume_to_gain_q16(RAOP_VOLUME_MAX_AIRPLAY_DB)
+                         : (int32_t)RAOP_VOLUME_GAIN_UNITY;
 }
 
 void raop_volume_scale_s16(int16_t *samples, size_t count, int32_t gain_q16)

@@ -12,8 +12,8 @@ A high-quality RAOP audio receiver implementation for ESP32 boards with external
   curve onto a capped digital range (−6 dBFS ceiling for headroom, −54 dBFS
   floor for a truly silent minimum); AirPlay mute (−144 dB) is digital silence.
   Before the remote sends its first volume the receiver sits at the top of the
-  slider, i.e. the −6 dBFS ceiling. Out-of-range values (anything outside
-  0…−30 dB that is not the mute sentinel) fail safe to the floor
+  slider, i.e. the −6 dBFS ceiling. Anything not provably in range (outside
+  0…−30 dB, including NaN from a corrupt command) fails safe to the floor.
 - **ALAC Decoding**: Apple Lossless audio codec support
 - **Robust Buffering**: ~23 seconds of audio buffering with automatic drift correction
 - **WLED Audio-Reactive Sync**: Real-time FFT analysis streamed to WLED devices for audio-reactive lighting effects (optional)
