@@ -20,7 +20,8 @@ tags: [audio, volume, raop, airplay, pcm5102a, bugfix]
 ## Root cause
 The AirPlay RAOP `SET_PARAMETER volume` value (contract: `0.0` loudest … `-30.0`
 quietest, `-144.0` mute sentinel) was forwarded **raw** and reinterpreted as a dBFS
-figure in `audio_buffer.c` (`powf(10, vol_db/20)` per sample). The RAOP slider is a
+figure in `audio_buffer.c` (one soft-float `powf(10, vol_db/20)` per ~8 ms frame,
+then a per-sample float multiply on a chip with no FPU). The RAOP slider is a
 *position*, not a gain. Upstream squeezelite-esp32 normalises on ingest
 (`volume = (volume == -144.0) ? 0 : (1 + volume / 30);`); this fork omitted that,
 and shairport-sync solves the same problem with a purpose-built transfer function
@@ -49,19 +50,28 @@ Single source of truth for the volume value, one attenuation stage, documented u
   headroom (full-scale sine and rail-to-rail never reach the rails), the
   first-unit-vs-last-unit dB step ≥ 2× non-linearity check, and the issue's
   11-point transfer table as a regression pin.
+- **Out-of-range fail-safe**: any value outside [0, −30] that is not the mute
+  sentinel maps to the *floor* (upstream `vol2attn()` behaviour — a malformed
+  high value from a corrupt `SET_PARAMETER` must never map to full volume).
+- **HARDWARE mode contract**: the library never scales PCM in HARDWARE mode
+  (buffer pinned at unity); documented on `RAOP_VOLUME_HARDWARE` and
+  `volume_cb` in `esp_raop_receiver.h`. `raop_cmd()`'s `dmcp.device-volume`
+  reporting passes raw dB through instead of misreading it as normalised 0–1.
 
 ## Verification
 - `make -C test && ./test/test_raop_volume` → all checks pass.
 - `gcc -fsyntax-only` against IDF stub headers for `audio_buffer.c`, `raop_core.c`,
   `i2s_output.c` — a syntax gate only, **not** a firmware build.
-- **`idf.py build` for esp32 + esp32s3 has NOT been run.** The OpenHands dev container
-  has no ESP-IDF and should not be asked to install one: the container filesystem is an
-  ephemeral overlay (only `~/.openhands` is a named volume), so a ~2-3 GB toolchain
-  download evaporates on rebuild. Nested Docker is also dead here — no CAP_SYS_ADMIN, so
-  `docker run` fails at `mount … operation not permitted`. Target builds belong on a real
-  IDF v5.5.1 machine; PR #4 carries a comment asking for them, and this stays open until
-  someone runs them. The modified files use no new IDF APIs, only pre-existing
-  atomics/ESP_LOG idioms, so risk is low — but unbuilt means not flashable.
+- **Target builds: DONE.** `idf.py build` for **esp32** and **esp32s3** on IDF v5.5.1
+  both pass clean (no warnings in the changed files), and the esp32 image was
+  flashed to a physical ESP32 (MAC ac:15:18:ec:68:f8): boots, joins WiFi, RAOP
+  receiver advertises, no crashes. (The OpenHands dev container that produced the
+  branch has no ESP-IDF: ephemeral overlay filesystem, no CAP_SYS_ADMIN for nested
+  Docker — builds belong on the host IDF v5.5.1 install at `~/esp/v5.5.1`.)
+- **Agentic review (run 1)** on PR #4: request-changes → fixed — PR-body
+  overclaims (per-sample `powf`, `(Volume-1)*30` "consistency" on dead code),
+  HARDWARE-mode contract documentation, out-of-range fail-safe, mute log line,
+  super-unity test comment.
 - Hardware: drag the iOS slider to both ends; expect silence at the bottom and no
   clipping at the top; `raop_core` now logs `Volume: AirPlay %.2f dB -> %.2f dBFS
   (Q16 gain N)` (1/s throttle) and the misleading `i2s_output: Volume set to...`

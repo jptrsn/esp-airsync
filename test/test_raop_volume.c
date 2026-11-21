@@ -57,9 +57,13 @@ static void test_endpoints(void)
     float span = raop_volume_to_dbfs(0.0f) - raop_volume_to_dbfs(-30.0f);
     CHECK(span >= 45.0f, "slider spans only %.2f dB, need >= 45 dB", span);
 
-    /* Out-of-range slider values clamp instead of misbehaving. */
-    CHECK_NEAR(raop_volume_to_dbfs(5.0f), RAOP_VOLUME_MAX_DBFS, 0.01f,
-               "volume +5.0 must clamp to the ceiling");
+    /* Out-of-range slider values fail safe to the floor (upstream
+     * vol2attn behaviour): a malformed high value must never map to full
+     * volume, and a below-range value must not be louder than the floor. */
+    CHECK_NEAR(raop_volume_to_dbfs(5.0f), RAOP_VOLUME_MIN_DBFS, 0.01f,
+               "volume +5.0 must fail safe to the floor");
+    CHECK(raop_volume_to_gain_q16(5.0f) <= raop_volume_to_gain_q16(-30.0f),
+          "volume +5.0 must not be louder than the slider bottom");
     CHECK_NEAR(raop_volume_to_dbfs(-100.0f), RAOP_VOLUME_MIN_DBFS, 0.01f,
                "volume -100 must clamp to the floor");
 }
@@ -211,10 +215,11 @@ static void test_scaler(void)
     CHECK(half[2] == 16383 && half[3] == -16384, "half gain wrong at rails: %d %d",
           half[2], half[3]);
 
-    /* A gain above unity saturates rather than wrapping. */
+    /* Gain >= unity is a documented pass-through no-op (the curve is capped
+     * below unity, so a real slider position never reaches this branch). */
     int16_t hot[2] = { 32767, -32768 };
     raop_volume_scale_s16(hot, 2, RAOP_VOLUME_GAIN_UNITY * 2);
-    CHECK(hot[0] == 32767 && hot[1] == -32768, "super-unity gain did not saturate: %d %d",
+    CHECK(hot[0] == 32767 && hot[1] == -32768, "unity-or-above gain was not a no-op: %d %d",
           hot[0], hot[1]);
 
     /* Every real slider position keeps samples inside int16 range. */

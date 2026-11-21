@@ -35,10 +35,16 @@ float raop_volume_to_dbfs(float airplay_db)
     if (airplay_db <= RAOP_VOLUME_MUTE_DB) {
         return RAOP_VOLUME_MIN_DBFS;
     }
-    if (airplay_db > RAOP_VOLUME_MAX_AIRPLAY_DB) {
-        airplay_db = RAOP_VOLUME_MAX_AIRPLAY_DB;
-    } else if (airplay_db < RAOP_VOLUME_MIN_AIRPLAY_DB) {
-        airplay_db = RAOP_VOLUME_MIN_AIRPLAY_DB;
+    if (airplay_db > RAOP_VOLUME_MAX_AIRPLAY_DB ||
+        airplay_db < RAOP_VOLUME_MIN_AIRPLAY_DB) {
+        /*
+         * Deliberate (and upstream) fail-safe: vol2attn() sends any
+         * out-of-range value (except the mute sentinel) to the *bottom* of
+         * the range — "for safety" in shairport-sync's words — rather than
+         * clamping a malformed high value (e.g. +20 dB from a corrupt
+         * SET_PARAMETER) up to full volume.
+         */
+        return RAOP_VOLUME_MIN_DBFS;
     }
 
     const float max_db100 = to_db100(RAOP_VOLUME_MAX_DBFS);

@@ -143,8 +143,12 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
                 uint32_t now = gettime_ms();
                 if (last_volume_log_ms == 0 || now - last_volume_log_ms >= 1000) {
                     last_volume_log_ms = now;
-                    ESP_LOGI(TAG, "Volume: AirPlay %.2f dB -> %.2f dBFS (Q16 gain %ld)",
-                             volume, raop_volume_to_dbfs(volume), (long)gain);
+                    if (gain == 0) {
+                        ESP_LOGI(TAG, "Volume: AirPlay %.2f dB -> mute (digital silence)", volume);
+                    } else {
+                        ESP_LOGI(TAG, "Volume: AirPlay %.2f dB -> %.2f dBFS (Q16 gain %ld)",
+                                 volume, raop_volume_to_dbfs(volume), (long)gain);
+                    }
                 }
             } else if (handle->config.volume_cb) {
                 // HARDWARE mode: the consumer owns the gain; the buffer stays at

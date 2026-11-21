@@ -46,7 +46,9 @@
  * @brief Map an AirPlay volume onto the configured dBFS range.
  *
  * @param airplay_db  Raw SET_PARAMETER volume: 0.0 (loudest) to -30.0
- *                    (quietest). Values outside that range are clamped;
+ *                    (quietest). Values outside that range fall to
+ *                    RAOP_VOLUME_MIN_DBFS (upstream's fail-safe: a malformed
+ *                    high value must never map to full volume);
  *                    RAOP_VOLUME_MUTE_DB (-144.0) yields RAOP_VOLUME_MIN_DBFS
  *                    here and a hard zero from raop_volume_to_gain_q16().
  * @return Target level in dBFS, within [RAOP_VOLUME_MIN_DBFS, RAOP_VOLUME_MAX_DBFS].

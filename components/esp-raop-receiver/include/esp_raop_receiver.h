@@ -20,7 +20,9 @@ typedef struct raop_handle_s raop_handle_t;
  */
 typedef enum {
     RAOP_VOLUME_SOFTWARE,  ///< Library applies volume scaling to PCM data
-    RAOP_VOLUME_HARDWARE   ///< Consumer handles volume control via callback
+    RAOP_VOLUME_HARDWARE   ///< Consumer owns all gain: the library never scales
+                           ///< PCM in this mode (buffer stays at unity) and
+                           ///< delivers raw dB to volume_cb instead
 } raop_volume_mode_t;
 
 /**
@@ -156,7 +158,10 @@ typedef struct {
 
     // Optional callbacks
     raop_event_cb_t event_cb;                ///< Event notifications (optional)
-    raop_volume_cb_t volume_cb;              ///< Volume control (required if HARDWARE mode)
+    raop_volume_cb_t volume_cb;              ///< Volume control (required if HARDWARE mode;
+                                             ///< in HARDWARE mode you receive every level change
+                                             ///< and must apply the gain yourself — the library
+                                             ///< passes PCM to audio_output_cb unattenuated)
     raop_pcm_tap_cb_t pcm_tap_cb;            ///< PCM tap for visualisation (optional, must not block)
 
     // User context

@@ -5,7 +5,13 @@ status: active
 tags: [build, esp-idf, ci, environment]
 ---
 
-# No ESP-IDF here, and no good way to get one — target builds are a human step
+# No ESP-IDF in the OpenHands container — but there IS one on the host
+
+> **Update 2026-11-21:** this entry describes the OpenHands automation container only.
+> The macOS dev host has a working **ESP-IDF v5.5.1** at `~/esp/v5.5.1/esp-idf`
+> (`source ~/esp/v5.5.1/esp-idf/export.sh`), a physical ESP32 on `/dev/cu.usbserial-0001`,
+> and PR #4's esp32 + esp32s3 builds both pass there clean. Run target builds on the
+> host; nothing below applies to it.
 
 ## Evidence (measured 2026-11-20 in the OpenHands automation container)
 
