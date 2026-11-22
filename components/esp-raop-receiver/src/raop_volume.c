@@ -12,8 +12,8 @@
  * y = output dBFS) give that audio-taper shape: a gentle slope over the top
  * third, a steeper middle, and a steep run into the floor.
  *
- * The curve is evaluated on the dB*100 integer scale used upstream, so it
- * stays bit-reproducible in the host unit test.
+ * The curve is evaluated in the dB×100 units upstream uses, so it stays
+ * reproducible in the host unit test.
  */
 #define AIRPLAY_SPAN_DB        (-30.0f)  /* slider travel on the x-axis, in dB */
 
@@ -39,7 +39,7 @@ float raop_volume_to_dbfs(float airplay_db)
      * SET_PARAMETER — goes to the bottom of the range ("for safety" in
      * shairport-sync's words). The negated in-range test is load-bearing:
      * every comparison is false for NaN, so an inverted check shape would
-     * let NaN fall through to the ceiling, i.e. full volume.
+     * let NaN fall through to the ceiling (loudest slider position).
      */
     if (!(airplay_db <= RAOP_VOLUME_MAX_AIRPLAY_DB &&
           airplay_db >= RAOP_VOLUME_MIN_AIRPLAY_DB)) {

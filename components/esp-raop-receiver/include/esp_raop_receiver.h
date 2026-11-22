@@ -43,7 +43,7 @@ typedef enum {
     RAOP_EVENT_PLAYING,       ///< Audio playback started
     RAOP_EVENT_STOPPED,       ///< Playback stopped
     RAOP_EVENT_PAUSED,        ///< Playback paused
-    RAOP_EVENT_VOLUME,        ///< Volume changed (hardware mode only)
+    RAOP_EVENT_VOLUME,        ///< Volume changed (delivered in both modes; volume_cb is HARDWARE mode only)
     RAOP_EVENT_METADATA,      ///< Track metadata received
     RAOP_EVENT_ARTWORK,       ///< Album artwork received
     RAOP_EVENT_PROGRESS,      ///< Playback progress update

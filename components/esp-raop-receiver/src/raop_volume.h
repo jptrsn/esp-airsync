@@ -50,7 +50,7 @@
  *                    out-of-range values, the mute sentinel, or NaN from a
  *                    corrupt SET_PARAMETER — falls to RAOP_VOLUME_MIN_DBFS
  *                    (upstream's fail-safe: a malformed value must never
- *                    map to full volume);
+ *                    map above the (capped) ceiling);
  *                    RAOP_VOLUME_MUTE_DB (-144.0) yields a hard zero from
  *                    raop_volume_to_gain_q16().
  * @return Target level in dBFS, within [RAOP_VOLUME_MIN_DBFS, RAOP_VOLUME_MAX_DBFS].

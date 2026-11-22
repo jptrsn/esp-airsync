@@ -54,7 +54,8 @@ Single source of truth for the volume value, one attenuation stage, documented u
   11-point transfer table as a regression pin.
 - **Out-of-range fail-safe**: any value outside [0, −30] that is not the mute
   sentinel maps to the *floor* (upstream `vol2attn()` behaviour — a malformed
-  high value from a corrupt `SET_PARAMETER` must never map to full volume).
+  high value from a corrupt `SET_PARAMETER` must never map above the
+  −6 dBFS ceiling).
 - **HARDWARE mode contract**: the library never scales PCM in HARDWARE mode
   (buffer pinned at unity); documented on `RAOP_VOLUME_HARDWARE` and
   `volume_cb` in `esp_raop_receiver.h`. `raop_cmd()`'s `dmcp.device-volume`
@@ -74,7 +75,7 @@ Single source of truth for the volume value, one attenuation stage, documented u
   overclaims (per-sample `powf`, `(Volume-1)*30` "consistency" on dead code),
   HARDWARE-mode contract documentation, out-of-range fail-safe, mute log line,
   super-unity test comment.
-- **Agentic review (run 2)**: the run-1 fail-safe leaked NaN to full volume
+- **Agentic review (run 2)**: the run-1 fail-safe leaked NaN to the ceiling
   (two-sided comparison is always false for NaN). Fix: upstream's *positive*
   in-range test `!(x <= MAX && x >= MIN) → floor`, plus NaN pins in the host
   test, `sscanf` return checked in `raop.c`, initial-gain-by-mode extracted to

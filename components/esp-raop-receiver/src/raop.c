@@ -278,7 +278,7 @@ bool raop_cmd(struct raop_ctx_s *ctx, raop_internal_event_t event, void *param) 
 			break;
 		case RAOP_INT_VOLUME: {
 			/* handle->volume is raw AirPlay dB (0.0 .. -30.0, -144.0 mute);
-			 * report it through unchanged instead of misreading it as a
+			 * clamp the mute sentinel and report raw dB instead of misreading it as a
 			 * normalised 0-1 figure. */
 			float Volume = *((float*) param);
 			Volume = (Volume <= -144.0f) ? -144.0f : Volume;
