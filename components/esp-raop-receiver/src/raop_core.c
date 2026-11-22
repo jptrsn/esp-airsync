@@ -1,6 +1,7 @@
 #include "esp_raop_receiver.h"
 #include "raop.h"
 #include "audio_buffer.h"
+#include "raop_volume.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -17,7 +18,14 @@ struct raop_handle_s {
     struct raop_ctx_s *raop_ctx;
     raop_config_t config;
     char device_name[64];
+    // Raw AirPlay slider dB (0.0 loudest, -30.0 quietest, -144.0 mute) as last
+    // sent by the remote — what raop_get_volume() and remote reporting use.
     float volume;
+    // Linear gain derived from `volume` through the raop_volume() transfer
+    // curve, Q16. Written by the RTSP thread on each volume change and read
+    // by the audio output task per frame; 32-bit aligned, so a torn read is
+    // impossible and one frame playing with the previous gain is harmless.
+    int32_t volume_gain_q16;
 };
 
 // ---- Internal callback: translates internal events to public API ----
@@ -48,7 +56,7 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
             }
 
             audio_buffer_init(handle->config.audio_output_cb, handle->config.user_ctx,
-                  handle->config.pcm_tap_cb, &handle->volume);
+                  handle->config.pcm_tap_cb, &handle->volume_gain_q16);
 
             if (handle->config.event_cb) {
                 handle->config.event_cb(RAOP_EVENT_CONNECTED, NULL, handle->config.user_ctx);
@@ -126,8 +134,25 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
             handle->volume = volume;
 
             if (handle->config.volume_mode == RAOP_VOLUME_SOFTWARE) {
-                // Will be applied in audio output path - store for use there
+                // One transfer-function evaluation per volume change; the audio
+                // output task only ever reads the cached Q16 gain.
+                int32_t gain = raop_volume_to_gain_q16(volume);
+                __atomic_store_n(&handle->volume_gain_q16, gain, __ATOMIC_RELEASE);
+                // Slider drags send a burst of SET_PARAMETER; log at most 1/s.
+                static uint32_t last_volume_log_ms = 0;
+                uint32_t now = gettime_ms();
+                if (last_volume_log_ms == 0 || now - last_volume_log_ms >= 1000) {
+                    last_volume_log_ms = now;
+                    if (gain == 0) {
+                        ESP_LOGI(TAG, "Volume: AirPlay %.2f dB -> mute (digital silence)", volume);
+                    } else {
+                        ESP_LOGI(TAG, "Volume: AirPlay %.2f dB -> %.2f dBFS (Q16 gain %ld)",
+                                 volume, raop_volume_to_dbfs(volume), (long)gain);
+                    }
+                }
             } else if (handle->config.volume_cb) {
+                // HARDWARE mode: the consumer owns the gain; the buffer stays at
+                // unity so exactly one stage ever scales PCM.
                 handle->config.volume_cb(volume, handle->config.user_ctx);
             }
 
@@ -218,7 +243,13 @@ esp_err_t raop_init(const raop_config_t *config, raop_handle_t **out_handle) {
 
     // Copy config
     memcpy(&handle->config, config, sizeof(raop_config_t));
-    handle->volume = 0.0f;
+    // Before the remote sends SET_PARAMETER volume, sit at the top of the
+    // slider (0.0 = loudest); the dBFS ceiling keeps that safely below full
+    // scale. In HARDWARE mode the library never scales PCM — the consumer
+    // owns the gain — so the buffer stays at unity.
+    handle->volume = RAOP_VOLUME_MAX_AIRPLAY_DB;
+    handle->volume_gain_q16 =
+        raop_volume_initial_gain_q16(config->volume_mode == RAOP_VOLUME_SOFTWARE);
 
     // Resolve device name
     uint8_t mac[6];

@@ -277,8 +277,11 @@ bool raop_cmd(struct raop_ctx_s *ctx, raop_internal_event_t event, void *param) 
 			command = strdup("volumedown");
 			break;
 		case RAOP_INT_VOLUME: {
+			/* handle->volume is raw AirPlay dB (0.0 .. -30.0, -144.0 mute);
+			 * clamp the mute sentinel and report raw dB instead of misreading it as a
+			 * normalised 0-1 figure. */
 			float Volume = *((float*) param);
-			Volume = Volume ? (Volume - 1) * 30 : -144;
+			Volume = (Volume <= -144.0f) ? -144.0f : Volume;
 			asprintf(&command,"setproperty?dmcp.device-volume=%0.4lf", Volume);
 			break;
 		}
@@ -592,8 +595,12 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		if (body && (p = strcasestr(body, "volume")) != NULL) {
 			float volume;
 
-			sscanf(p, "%*[^:]:%f", &volume);
-			success = ctx->cmd_cb(RAOP_INT_VOLUME, volume);
+			/* Only forward a value we actually parsed: on parse failure
+			 * `volume` is uninitialised stack garbage, and raop_volume's
+			 * fail-safe should be defence in depth, not the first line. */
+			if (sscanf(p, "%*[^:]:%f", &volume) == 1) {
+				success = ctx->cmd_cb(RAOP_INT_VOLUME, volume);
+			}
 		} else if (body && (p = strcasestr(body, "progress")) != NULL) {
 			int start, current, stop = 0;
 

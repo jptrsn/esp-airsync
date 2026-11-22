@@ -20,7 +20,9 @@ typedef struct raop_handle_s raop_handle_t;
  */
 typedef enum {
     RAOP_VOLUME_SOFTWARE,  ///< Library applies volume scaling to PCM data
-    RAOP_VOLUME_HARDWARE   ///< Consumer handles volume control via callback
+    RAOP_VOLUME_HARDWARE   ///< Consumer owns all gain: the library never scales
+                           ///< PCM in this mode (buffer stays at unity) and
+                           ///< delivers raw dB to volume_cb instead
 } raop_volume_mode_t;
 
 /**
@@ -41,7 +43,7 @@ typedef enum {
     RAOP_EVENT_PLAYING,       ///< Audio playback started
     RAOP_EVENT_STOPPED,       ///< Playback stopped
     RAOP_EVENT_PAUSED,        ///< Playback paused
-    RAOP_EVENT_VOLUME,        ///< Volume changed (hardware mode only)
+    RAOP_EVENT_VOLUME,        ///< Volume changed (delivered in both modes; volume_cb is HARDWARE mode only)
     RAOP_EVENT_METADATA,      ///< Track metadata received
     RAOP_EVENT_ARTWORK,       ///< Album artwork received
     RAOP_EVENT_PROGRESS,      ///< Playback progress update
@@ -93,7 +95,11 @@ typedef void (*raop_audio_output_cb_t)(
 /**
  * @brief Volume change callback (HARDWARE mode only)
  *
- * @param volume Volume level (0.0 to 1.0)
+ * @param volume Raw AirPlay slider level in dB, exactly as the remote sent it:
+ *               0.0 is loudest, -30.0 quietest, -144.0 is the mute sentinel.
+ *               This is NOT a linear 0.0-1.0 gain and NOT a dBFS figure; a
+ *               hardware consumer must apply its own transfer curve (see
+ *               raop_volume.h for the curve the SOFTWARE path uses).
  * @param user_ctx User context pointer from config
  */
 typedef void (*raop_volume_cb_t)(
@@ -152,7 +158,10 @@ typedef struct {
 
     // Optional callbacks
     raop_event_cb_t event_cb;                ///< Event notifications (optional)
-    raop_volume_cb_t volume_cb;              ///< Volume control (required if HARDWARE mode)
+    raop_volume_cb_t volume_cb;              ///< Volume control (required if HARDWARE mode;
+                                             ///< in HARDWARE mode you receive every level change
+                                             ///< and must apply the gain yourself — the library
+                                             ///< passes PCM to audio_output_cb unattenuated)
     raop_pcm_tap_cb_t pcm_tap_cb;            ///< PCM tap for visualisation (optional, must not block)
 
     // User context
@@ -197,6 +206,11 @@ esp_err_t raop_set_device_name(raop_handle_t *handle, const char *name);
 
 /**
  * @brief Get current volume level
+ *
+ * @return Raw AirPlay slider level in dB as last sent by the remote: 0.0
+ *         loudest, -30.0 quietest, -144.0 mute. Not a linear gain, not dBFS.
+ *         The gain actually applied to PCM in SOFTWARE mode is derived from it
+ *         by the transfer curve in raop_volume.h.
  */
 float raop_get_volume(raop_handle_t *handle);
 

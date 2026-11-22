@@ -33,3 +33,8 @@ __pycache__/
 *.tmp
 *.bak
 *.orig
+# Host unit test build output
+test/test_raop_volume
+build*/
+sdkconfig.esp32
+sdkconfig.esp32s3

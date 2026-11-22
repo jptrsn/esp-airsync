@@ -6,7 +6,6 @@
 #include "freertos/FreeRTOS.h"
 
 static const char *TAG = "i2s_output";
-static float current_volume = 1.0f;
 
 static i2s_chan_handle_t tx_handle = NULL;
 
@@ -17,12 +16,6 @@ static i2s_chan_handle_t tx_handle = NULL;
 static uint64_t i2s_total_bytes = 0;
 static uint32_t i2s_last_log_ms = 0;
 static uint64_t i2s_last_log_bytes = 0;
-
-void i2s_output_set_volume(float volume)
-{
-    current_volume = (volume < 0.0f) ? 0.0f : (volume > 1.0f) ? 1.0f : volume;
-    ESP_LOGI(TAG, "Volume set to %.2f (%d%%)", current_volume, (int)(current_volume * 100));
-}
 
 void i2s_output_init(int bck_pin, int ws_pin, int dout_pin)
 {
@@ -90,56 +83,12 @@ void i2s_output_write(const uint8_t *data, size_t len)
         return;
     }
 
-    // Pre-allocated volume-scaling scratch, sized to the max audio frame. Never
-    // allocated in the hot path: a mid-stream malloc can fail under memory
-    // pressure and would otherwise spin forever logging errors, starving CPU
-    // and the WiFi stack (which manifests as total packet loss).
-    #define VOLUME_BUF_MAX 2048
-    static int16_t volume_buf[VOLUME_BUF_MAX / sizeof(int16_t)];
-    // audio_buffer caps frames at MAX_FRAME_SIZE == 2048 (see audio_buffer.c), so
-    // for that producer this scratch always fits. i2s_output_write() is a public
-    // entry point with no size contract, though, so a caller that bypasses
-    // audio_buffer can still exceed it -- the pass-through below is a safety
-    // valve for that case, not dead code.
-    if (len > sizeof(volume_buf)) {
-        // Reachable only via a caller that bypasses audio_buffer sizing. Pass
-        // through unscaled rather than drop audio, and warn once so it is noticed.
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            ESP_LOGW(TAG, "frame %u > volume scratch, volume not applied", (unsigned)len);
-        }
-        size_t _w = 0;
-        i2s_channel_write(tx_handle, data, len, &_w, portMAX_DELAY);
-        return;
-    }
-
-    const uint8_t *output_data;
-
-    // Skip scaling if at full volume
-    if (current_volume >= 0.99f) {
-        output_data = data;
-    } else {
-        // Apply volume scaling
-        int16_t *samples = (int16_t *)data;
-        size_t sample_count = len / sizeof(int16_t);
-
-        for (size_t i = 0; i < sample_count; i++) {
-            int32_t scaled_sample = (int32_t)(samples[i] * current_volume);
-            if (scaled_sample > 32767) scaled_sample = 32767;
-            if (scaled_sample < -32768) scaled_sample = -32768;
-            volume_buf[i] = (int16_t)scaled_sample;
-        }
-        output_data = (uint8_t *)volume_buf;
-    }
-
-    // if (call_count++ % 100 == 0) {
-    //     ESP_LOGI(TAG, "Writing %zu bytes to I2S (call #%lu)",
-    //              len, call_count);
-    // }
+    // This stage does not scale PCM: software volume is applied exactly once,
+    // in audio_buffer's output task via the raop_volume() transfer curve
+    // (components/esp-raop-receiver/src/raop_volume.h).
 
     size_t bytes_written = 0;
-    esp_err_t ret = i2s_channel_write(tx_handle, output_data, len, &bytes_written, portMAX_DELAY);
+    esp_err_t ret = i2s_channel_write(tx_handle, data, len, &bytes_written, portMAX_DELAY);
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));

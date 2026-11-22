@@ -10,9 +10,16 @@ typedef void (*audio_output_callback_t)(const uint8_t *data, size_t len, void *u
 // PCM tap callback - called with audio data at the moment it is sent to hardware
 typedef void (*audio_pcm_tap_cb_t)(const uint8_t *data, size_t len, void *user_ctx);
 
-// Initialize the audio buffer with output callback
+/**
+ * Initialize the audio buffer with output callback.
+ *
+ * @param volume_gain_q16  Pointer to the Q16 linear gain (see raop_volume.h)
+ *                         applied to PCM on the way out, or NULL to pass the
+ *                         audio through unscaled. Owned by the caller; read
+ *                         per frame by the output task.
+ */
 void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
-                       audio_pcm_tap_cb_t tap_cb, float *volume_ptr);
+                       audio_pcm_tap_cb_t tap_cb, int32_t *volume_gain_q16);
 
 // Start audio playback task
 void audio_buffer_start(void);
