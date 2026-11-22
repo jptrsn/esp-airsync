@@ -1,10 +1,22 @@
-# Session notes — 2026-11-19
+# Session notes — 2026-11-21
 
 Working tree was clean on `main` at end of session. This file captures state that
 matters for picking the work back up.
 
 ## Where things stand
 
+- **v0.2.6 released** (gitflow release branch `release/v0.2.6`, merged to `main`
+  and `develop`, tagged): volume-control fix for issue #3 — AirPlay slider now maps
+  through a shairport-sync `vol2attn()` audio-taper onto a capped [−6, −54] dBFS
+  range (one transfer function, one Q16 gain per volume change, one PCM scaling
+  stage, dead i2s volume stage deleted). Builds clean esp32+esp32s3 on IDF v5.5.1,
+  host unit test `make -C test`, flashed & booted on ESP-68F8. Five agentic review
+  rounds on PR #4 ending `approve` (see PR comments); NaN/malformed `SET_PARAMETER`
+  fails safe to the floor.
+- **PR #4 merged** (`224ecce`) from `openhands/issue-3`.
+- **Gitflow initialised**: `main` = production, `develop` = integration
+  (created from `main` at v0.2.6). Release flow from now on:
+  `git flow release start vX.Y.Z` → bump `PROJECT_VER` → `git flow release finish`.
 - **v0.2.5 released**: https://github.com/jptrsn/esp-airsync/releases/tag/v0.2.5
   - Tag `v0.2.5` → commit `269b335` ("version bump"), on `main`.
   - Assets: `esp-airsync-esp32.bin`, `esp-airsync-esp32s3.bin`,
@@ -72,3 +84,5 @@ Build per target (`idf.py set-target esp32` / `esp32s3`), then copy:
 ## Current live state (was true at session end)
 - owntone: ESP-68F8 (esp32 soundbar) selected + playing; Volumio Kitchen also selected.
 - ESP32-S3 (`ESP-CAAC64`) flashed with v0.2.5, running, but NOT selected in owntone.
+- ESP-68F8 (esp32) flashed with the v0.2.6 volume-control build, boots clean
+  (WiFi + mDNS + RAOP up); re-test iOS slider end-to-end on the release bin.
