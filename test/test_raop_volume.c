@@ -142,7 +142,6 @@ static void test_headroom(void)
 
     raop_volume_scale_s16(sine, N, raop_volume_to_gain_q16(0.0f));
     for (int i = 0; i < N; i++) {
-        CHECK(sine[i] <= 32767 && sine[i] >= -32768, "sine clipped at sample %d", i);
         int32_t a = sine[i] < 0 ? -sine[i] : sine[i];
         /* ~6 dB ceiling => peak lands near half scale, nowhere near the rail. */
         CHECK(a < 32767, "sine reached the full-scale rail at sample %d", i);
@@ -249,7 +248,15 @@ static void test_scaler(void)
     CHECK(hot[0] == 32767 && hot[1] == -32768, "unity-or-above gain was not a no-op: %d %d",
           hot[0], hot[1]);
 
-    /* Every real slider position keeps samples inside int16 range. */
+    /* The int32 product must be provable not to overflow before the shift:
+     * worst |product| is the negative rail at the highest in-contract gain.
+     * (Per-sample int16 range after the shift is a typing property, not a
+     * behaviour worth asserting — this invariant is the one that could rot.) */
+    CHECK((int64_t)32768 * (RAOP_VOLUME_GAIN_UNITY - 1) <= INT32_MAX,
+          "Q16 product can overflow int32 at the rails");
+
+    /* Every real slider position leaves rail inputs at the rails (saturating
+     * multiply-shift must not wrap them to the opposite sign). */
     for (float v = 0.0f; v >= RAOP_VOLUME_MIN_AIRPLAY_DB; v -= 0.5f) {
         int16_t buf[16];
         for (size_t i = 0; i < 16; i++) {
@@ -257,8 +264,8 @@ static void test_scaler(void)
         }
         raop_volume_scale_s16(buf, 16, raop_volume_to_gain_q16(v));
         for (size_t i = 0; i < 16; i++) {
-            CHECK(buf[i] <= 32767 && buf[i] >= -32768,
-                  "volume %.2f produced out-of-range sample %d", v, buf[i]);
+            CHECK((buf[i] >= 0) == (i % 2 == 1),
+                  "volume %.2f flipped a rail sample's sign (wrapped?): %d", v, buf[i]);
         }
     }
 }
