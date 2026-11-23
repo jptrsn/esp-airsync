@@ -9,10 +9,10 @@ captive portal + OTA. GPL-3.0. Version is `PROJECT_VER` in `CMakeLists.txt`
 ## Layout
 
 - `main/` — `main.c`, `wifi_manager.c` (captive portal `ESP-AIRSYNC-XXXXXX` is
-  currently **open** — `WIFI_AUTH_OPEN`, no password: the WPA2 `authmode` and the
-  `AP_PASSWORD` copy are both commented out at `wifi_manager.c:117-133`, so
-  `espairsync` is dead and `README.md` still advertises it; config page at
-  `192.168.4.1`), `web_server.c`
+  currently **open** — `WIFI_AUTH_OPEN`, no password; the WPA2 `authmode` and the
+  `AP_PASSWORD` copy are both commented out at `wifi_manager.c:117-133`, leaving
+  `AP_PASSWORD` (`espairsync`) as dead code — revisit it if the AP is meant to be
+  secured; config page at `192.168.4.1`), `web_server.c`
   (esp_http_server, config + OTA pages), `config_manager.c` (NVS namespaces
   `wifi_config`, `device_config`, `i2s_config`, `wled_config`).
 - `components/esp-raop-receiver/` — the RAOP library (RTSP `raop.c`, RTP +
