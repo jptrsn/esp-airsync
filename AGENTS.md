@@ -8,8 +8,11 @@ captive portal + OTA. GPL-3.0. Version is `PROJECT_VER` in `CMakeLists.txt`
 
 ## Layout
 
-- `main/` — `main.c`, `wifi_manager.c` (captive portal `ESP-AIRSYNC-XXXXXX`,
-  password `espairsync`, config page at `192.168.4.1`), `web_server.c`
+- `main/` — `main.c`, `wifi_manager.c` (captive portal `ESP-AIRSYNC-XXXXXX` is
+  currently **open** — `WIFI_AUTH_OPEN`, no password: the WPA2 `authmode` and the
+  `AP_PASSWORD` copy are both commented out at `wifi_manager.c:117-133`, so
+  `espairsync` is dead and `README.md` still advertises it; config page at
+  `192.168.4.1`), `web_server.c`
   (esp_http_server, config + OTA pages), `config_manager.c` (NVS namespaces
   `wifi_config`, `device_config`, `i2s_config`, `wled_config`).
 - `components/esp-raop-receiver/` — the RAOP library (RTSP `raop.c`, RTP +
@@ -92,10 +95,13 @@ Do not invent a lint or CI command; match the surrounding style instead.
 ## Gotchas
 
 - **Task priorities/affinity are load-bearing.** RTP RX (`CONFIG_PTHREAD_TASK_PRIO_DEFAULT + 5`,
-  affinity per the IDF pthread default) > mDNS responder (priority 5, pinned
-  core 1) > decode (priority `default − 1`, pinned core 0) > audio output
-  (priority 3, core 1). If you retune these, keep mDNS schedulable or the
-  "device disappears mid-playback" symptom returns; the `CONFIG_MDNS_TASK_AFFINITY_CPU1`
+  affinity per the IDF pthread default) > mDNS responder (`CONFIG_MDNS_TASK_PRIORITY=5`,
+  i.e. *level with* the pthread default — it is unset in every `sdkconfig.defaults*`, so
+  the IDF default is 5; pinned core 1) > decode (priority `default − 1`, pinned core 0)
+  > audio output (priority 3, core 1). If you retune these, keep mDNS schedulable or the
+  "device disappears mid-playback" symptom returns, but do **not** raise it above the
+  audio path either — that only trades one starvation for another
+  (`sdkconfig.defaults.esp32:20-22`). The `CONFIG_MDNS_TASK_AFFINITY_CPU1`
   block is duplicated in both `sdkconfig.defaults.<target>` files because it
   depends on `!FREERTOS_UNICORE` and must not sit in the shared defaults.
 - **`xTaskCreateStatic*` takes a count of `StackType_t` elements, not bytes.**
@@ -111,9 +117,13 @@ Do not invent a lint or CI command; match the surrounding style instead.
   gain → a single PCM scaling stage in `audio_buffer.c`. Never add a second
   gain stage, and keep out-of-range/NaN input failing safe to the floor
   (`.agent/memory/volume-control-airplay-dBFS-transfer-function.md`).
-- The 5-second `health` / `rtp health` / drift / i2s throughput logs are
-  deliberate diagnostics — keep them; they are how the next audio bug gets
-  diagnosed.
+- The health/drift/throughput logs are deliberate diagnostics — keep them; they
+  are how the next audio bug gets diagnosed. Their cadences differ, so don't use
+  one line's timing to judge another: `rtp health` (`rtp.c:934`) and the i2s
+  throughput log (`i2s_output.c:101`) are every 5 s, `health` in `audio_buffer.c`
+  is every **30 s** (deliberately rare to avoid flooding UART), and the
+  `drift: SKIP` / `drift: PAUSE` warnings (`raop_core.c`) are event-driven, not
+  periodic — absence just means sync stayed inside ±50 ms.
 - `SESSION_NOTES.md` records hardware state and validation results (serial
   ports, owntone test endpoints, per-board flashing quirks) as of the last
   session; treat it as dated context, not current truth.
