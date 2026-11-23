@@ -72,7 +72,7 @@ idf.py -p /dev/ttyUSB0 flash monitor
 ### Initial Configuration
 
 1. On first boot, the device creates a WiFi access point named `ESP-AIRSYNC-XXXXXX`
-2. Connect to this network (password: `espairsync`)
+2. Connect to this network (it is open — no password)
 3. Navigate to `192.168.4.1` in your browser
 4. Enter your WiFi credentials and configure I²S pins if needed
 5. Configure device name, if desired
